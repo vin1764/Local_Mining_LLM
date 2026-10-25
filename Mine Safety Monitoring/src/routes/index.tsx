@@ -1,0 +1,468 @@
+import { useEffect, useMemo, useState } from "react";
+import { useMutation } from "@tanstack/react-query";
+import { createFileRoute } from "@tanstack/react-router";
+import {
+  BrainCircuit,
+  CircleDot,
+  Cpu,
+  GitBranch,
+  HardHat,
+  RefreshCw,
+  ScanSearch,
+  TriangleAlert,
+  Waves,
+} from "lucide-react";
+
+import { UploadZone } from "@/components/upload-zone";
+import { EmptyChartNote, MiniChart, SectionHeader, TrendConsole } from "@/components/charts";
+import {
+  buildProfile,
+  computeAnomalies,
+  formatValue,
+  prettyName,
+  type Dataset,
+  type DatasetInsights,
+  type DatasetProfile,
+} from "@/lib/dataset";
+import { analyzeDataset } from "@/lib/ai/analyze.functions";
+
+export const Route = createFileRoute("/")({
+  head: () => ({
+    meta: [
+      { title: "STRATA — Mine Operations Dashboard" },
+      {
+        name: "description",
+        content:
+          "Upload mine-site CSV logs and get multi-parameter trends, correlations, outlier flags and an AI analyst read in one dashboard.",
+      },
+      { property: "og:title", content: "STRATA — Mine Operations Dashboard" },
+      {
+        property: "og:description",
+        content:
+          "Upload mine-site CSV logs and get multi-parameter trends, correlations, outlier flags and an AI analyst read in one dashboard.",
+      },
+      { property: "og:type", content: "website" },
+      { name: "twitter:card", content: "summary_large_image" },
+    ],
+  }),
+  component: Dashboard,
+});
+
+/* ---------------- Small readout pieces ---------------- */
+
+function StatBlock({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-md border border-border bg-surface px-3 py-2">
+      <p className="font-mono text-[10px] tracking-wider text-muted-foreground">{label}</p>
+      <p className="mt-0.5 truncate font-mono text-sm font-semibold text-foreground">{value}</p>
+    </div>
+  );
+}
+
+function HazardStrip() {
+  return <div className="hazard h-1.5 w-full" aria-hidden="true" />;
+}
+
+const SEVERITY_STYLES: Record<DatasetInsights["findings"][number]["severity"], string> = {
+  normal: "border-positive/50 bg-positive/10 text-positive",
+  watch: "border-warning/50 bg-warning/10 text-warning",
+  critical: "border-negative/50 bg-negative/15 text-negative",
+};
+
+const SEVERITY_LABEL: Record<DatasetInsights["findings"][number]["severity"], string> = {
+  normal: "NOMINAL",
+  watch: "WATCH",
+  critical: "CRITICAL",
+};
+
+/* ---------------- AI analyst panel ---------------- */
+
+function AnalystPanel({ dataset }: { dataset: Dataset | null }) {
+  const run = useMutation({
+    mutationFn: (profile: DatasetProfile) => analyzeDataset({ data: profile }),
+  });
+
+  // Auto-run whenever a fresh dataset lands.
+  useEffect(() => {
+    run.reset();
+    if (dataset) run.mutate(buildProfile(dataset));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dataset]);
+
+  const insights = run.data;
+
+  if (!dataset) {
+    return (
+      <div className="rounded-md border border-dashed border-border bg-surface px-5 py-8 text-center">
+        <BrainCircuit className="mx-auto size-7 text-muted-foreground" />
+        <p className="mt-2 font-mono text-xs tracking-wider text-muted-foreground">
+          ANALYST ON STANDBY — LOAD A DATASET TO WAKE IT UP
+        </p>
+      </div>
+    );
+  }
+
+  if (run.isPending) {
+    return (
+      <div className="scanline rounded-md border border-border bg-surface px-5 py-8 text-center">
+        <Cpu className="mx-auto size-7 text-primary" />
+        <p className="mt-2 font-mono text-xs tracking-wider text-primary status-blink">
+          PROCESSING {dataset.rowCount} ROWS × {dataset.numericNames.length} PARAMETERS…
+        </p>
+        <p className="mt-1 font-mono text-[10px] text-muted-foreground">
+          Statistical profile compiled · analyst model reading now
+        </p>
+      </div>
+    );
+  }
+
+  if (run.isError) {
+    return (
+      <div className="rounded-md border border-negative/50 bg-negative/10 px-5 py-6">
+        <p className="flex items-center gap-2 font-mono text-xs text-negative">
+          <TriangleAlert className="size-4 shrink-0" />
+          {run.error instanceof Error ? run.error.message : "Analyst call failed."}
+        </p>
+        <button
+          onClick={() => run.mutate(buildProfile(dataset))}
+          className="mt-3 flex items-center gap-2 rounded-sm border border-border bg-surface px-3 py-1.5 font-mono text-[11px] tracking-wider text-foreground transition-colors hover:border-primary/60"
+        >
+          <RefreshCw className="size-3.5" />
+          RETRY ANALYSIS
+        </button>
+      </div>
+    );
+  }
+
+  if (!insights) return null;
+
+  return (
+    <div className="grid gap-4 lg:grid-cols-[1.1fr_1fr]">
+      <div className="rounded-md border border-primary/40 bg-surface p-5">
+        <p className="font-mono text-[10px] tracking-wider text-primary">HEADLINE READ</p>
+        <p className="font-display text-3xl leading-tight tracking-wide text-foreground text-glow">
+          {insights.headline}
+        </p>
+        <p className="mt-3 text-sm leading-relaxed text-muted-foreground">{insights.summary}</p>
+      </div>
+      <div className="grid gap-3">
+        <div className="grid gap-2">
+          {insights.findings.map((f, i) => (
+            <div
+              key={i}
+              className="flex items-start gap-3 rounded-md border border-border bg-surface px-3 py-2"
+            >
+              <span
+                className={`mt-0.5 shrink-0 rounded-sm border px-1.5 py-0.5 font-mono text-[9px] tracking-wider ${SEVERITY_STYLES[f.severity]}`}
+              >
+                {SEVERITY_LABEL[f.severity]}
+              </span>
+              <p className="min-w-0 text-xs leading-relaxed text-foreground">
+                <span className="font-mono font-semibold">{prettyName(f.parameter)}</span>
+                <span className="text-muted-foreground"> — {f.observation}</span>
+              </p>
+            </div>
+          ))}
+        </div>
+        <div className="rounded-md border border-border bg-surface-2 p-3">
+          <p className="font-mono text-[10px] tracking-wider text-primary">SHIFT ACTIONS</p>
+          <ol className="mt-1.5 grid gap-1">
+            {insights.recommendations.map((rec, i) => (
+              <li key={i} className="flex gap-2 text-xs text-foreground">
+                <span className="font-mono text-muted-foreground">{String(i + 1).padStart(2, "0")}</span>
+                {rec}
+              </li>
+            ))}
+          </ol>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- Correlation + anomaly panels ---------------- */
+
+function CorrelationPanel({ dataset }: { dataset: Dataset }) {
+  const pairs = useMemo(() => {
+    // Reuse the profile's correlation routine by building a lightweight profile.
+    return buildProfile(dataset).correlations;
+  }, [dataset]);
+
+  return (
+    <div className="rounded-md border border-border bg-surface p-4">
+      <p className="flex items-center gap-2 font-mono text-[11px] font-semibold tracking-wider text-foreground">
+        <GitBranch className="size-3.5 text-primary" />
+        PARAMETER CORRELATIONS (|r| ≥ 0.35)
+      </p>
+      {pairs.length === 0 ? (
+        <p className="mt-3 font-mono text-xs text-muted-foreground">
+          No strong pairwise relationships in this dataset.
+        </p>
+      ) : (
+        <ul className="mt-3 grid gap-2.5">
+          {pairs.map((p) => (
+            <li key={`${p.a}-${p.b}`} className="grid gap-1">
+              <div className="flex items-baseline justify-between gap-3 font-mono text-[11px]">
+                <span className="truncate text-foreground">
+                  {prettyName(p.a)} <span className="text-muted-foreground">↔</span> {prettyName(p.b)}
+                </span>
+                <span
+                  className={`shrink-0 font-semibold ${p.r >= 0 ? "text-positive" : "text-negative"}`}
+                >
+                  r = {p.r >= 0 ? "+" : ""}
+                  {p.r.toFixed(2)}
+                </span>
+              </div>
+              <div className="relative h-1.5 overflow-hidden rounded-sm bg-surface-2">
+                <div
+                  className="absolute inset-y-0 rounded-sm"
+                  style={{
+                    left: "50%",
+                    width: `${Math.abs(p.r) * 50}%`,
+                    transform: p.r >= 0 ? "none" : "translateX(-100%)",
+                    background: p.r >= 0 ? "var(--color-positive)" : "var(--color-negative)",
+                  }}
+                />
+                <div className="absolute inset-y-0 left-1/2 w-px bg-border" />
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function AnomalyPanel({ dataset }: { dataset: Dataset }) {
+  const anomalies = useMemo(() => computeAnomalies(dataset, 10), [dataset]);
+
+  return (
+    <div className="rounded-md border border-border bg-surface p-4">
+      <p className="flex items-center gap-2 font-mono text-[11px] font-semibold tracking-wider text-foreground">
+        <ScanSearch className="size-3.5 text-primary" />
+        TOP OUTLIERS (|z| ≥ 3)
+      </p>
+      {anomalies.length === 0 ? (
+        <p className="mt-3 font-mono text-xs text-muted-foreground">
+          No 3-sigma outliers detected — the seam is behaving.
+        </p>
+      ) : (
+        <table className="mt-3 w-full font-mono text-[11px]">
+          <thead>
+            <tr className="text-left text-muted-foreground">
+              <th className="pb-1 font-medium tracking-wider">PARAMETER</th>
+              <th className="pb-1 font-medium tracking-wider">AT</th>
+              <th className="pb-1 text-right font-medium tracking-wider">VALUE</th>
+              <th className="pb-1 text-right font-medium tracking-wider">Z</th>
+            </tr>
+          </thead>
+          <tbody>
+            {anomalies.map((a, i) => (
+              <tr key={i} className="border-t border-border/60">
+                <td className="py-1.5 pr-2 text-foreground">{prettyName(a.column)}</td>
+                <td className="py-1.5 pr-2 text-muted-foreground">{a.label}</td>
+                <td className="py-1.5 pr-2 text-right text-foreground">{formatValue(a.value)}</td>
+                <td className="py-1.5 text-right font-semibold text-negative">{a.z.toFixed(2)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+function CategoryPanel({ dataset }: { dataset: Dataset }) {
+  if (dataset.categoryNames.length === 0) return null;
+  return (
+    <p className="mt-3 flex flex-wrap items-center gap-2 font-mono text-[11px] text-muted-foreground">
+      <CircleDot className="size-3 text-primary" />
+      CATEGORY COLUMNS:
+      {dataset.categoryNames.map((c) => (
+        <span key={c} className="rounded-sm border border-border bg-surface px-1.5 py-0.5 text-foreground">
+          {prettyName(c)}
+        </span>
+      ))}
+    </p>
+  );
+}
+
+/* ---------------- Page ---------------- */
+
+function Dashboard() {
+  const [dataset, setDataset] = useState<Dataset | null>(null);
+  const [selected, setSelected] = useState<string[]>([]);
+  const [normalized, setNormalized] = useState(false);
+
+  const handleDataset = (d: Dataset) => {
+    setDataset(d);
+    setSelected(d.numericNames.slice(0, 5));
+    setNormalized(false);
+  };
+
+  const toggle = (name: string) =>
+    setSelected((prev) => (prev.includes(name) ? prev.filter((n) => n !== name) : [...prev, name]));
+
+  const stats = useMemo(() => {
+    if (!dataset) return null;
+    const outlierTotal = dataset.numericNames.reduce(
+      (sum, n) => sum + (dataset.columns.find((c) => c.name === n)?.stats?.anomalyCount ?? 0),
+      0,
+    );
+    let span = "—";
+    if (dataset.timeColumn) {
+      const labels = dataset.rows.map((r) => String(r[dataset.timeColumn!] ?? ""));
+      span = `${labels[0] ?? ""} → ${labels[labels.length - 1] ?? ""}`;
+    }
+    return { outlierTotal, span };
+  }, [dataset]);
+
+  return (
+    <div className="min-h-screen">
+      <HazardStrip />
+
+      {/* Header */}
+      <header className="border-b border-border bg-surface">
+        <div className="mx-auto flex max-w-6xl flex-wrap items-center gap-x-6 gap-y-2 px-4 py-4 sm:px-6">
+          <div className="flex items-center gap-3">
+            <span className="flex size-11 items-center justify-center rounded-md border border-primary/50 bg-primary/10">
+              <HardHat className="size-6 text-primary" />
+            </span>
+            <div>
+              <h1 className="font-display text-3xl leading-none tracking-widest text-foreground text-glow">
+                STRATA
+              </h1>
+              <p className="font-mono text-[10px] tracking-[0.25em] text-muted-foreground">
+                MINE DATA INTELLIGENCE
+              </p>
+            </div>
+          </div>
+          <div className="ml-auto flex items-center gap-2 font-mono text-[10px] tracking-wider">
+            <span
+              className={`flex items-center gap-1.5 rounded-sm border px-2 py-1 ${
+                dataset
+                  ? "border-positive/50 bg-positive/10 text-positive"
+                  : "border-border bg-surface-2 text-muted-foreground"
+              }`}
+            >
+              <Waves className={`size-3 ${dataset ? "status-blink" : ""}`} />
+              {dataset ? "SIGNAL LIVE" : "AWAITING FEED"}
+            </span>
+          </div>
+        </div>
+      </header>
+
+      <main className="mx-auto grid max-w-6xl gap-10 px-4 py-8 sm:px-6">
+        {/* 01 — Ingest */}
+        <section>
+          <SectionHeader
+            index="01"
+            title="FEED INTAKE"
+            right={
+              <span className="font-mono text-[10px] tracking-wider text-muted-foreground">
+                CSV · AUTO-TYPED COLUMNS
+              </span>
+            }
+          />
+          <UploadZone onDataset={handleDataset} compact={!!dataset} />
+
+          {dataset && stats && (
+            <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
+              <StatBlock label="ROWS" value={String(dataset.rowCount)} />
+              <StatBlock label="NUMERIC PARAMS" value={String(dataset.numericNames.length)} />
+              <StatBlock label="TIME COLUMN" value={dataset.timeColumn ? prettyName(dataset.timeColumn) : "NONE"} />
+              <StatBlock label="WINDOW" value={stats.span} />
+              <StatBlock label="OUTLIERS TOTAL" value={String(stats.outlierTotal)} />
+            </div>
+          )}
+        </section>
+
+        {/* 02 — Trend console */}
+        <section>
+          <SectionHeader
+            index="02"
+            title="TREND CONSOLE"
+            right={
+              <span className="font-mono text-[10px] tracking-wider text-muted-foreground">
+                MULTI-PARAMETER OVERLAY
+              </span>
+            }
+          />
+          {dataset ? (
+            <TrendConsole
+              dataset={dataset}
+              selected={selected}
+              normalized={normalized}
+              onToggle={toggle}
+              onNormalized={setNormalized}
+            />
+          ) : (
+            <EmptyChartNote />
+          )}
+        </section>
+
+        {/* 03 — Parameter deck */}
+        <section>
+          <SectionHeader
+            index="03"
+            title="PARAMETER DECK"
+            right={
+              <span className="font-mono text-[10px] tracking-wider text-muted-foreground">
+                7-DAY MOVING AVERAGE PER PARAMETER
+              </span>
+            }
+          />
+          {dataset ? (
+            <div>
+              <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                {dataset.numericNames.map((name, i) => (
+                  <MiniChart key={name} dataset={dataset} column={name} colorIndex={i} />
+                ))}
+              </div>
+              <CategoryPanel dataset={dataset} />
+            </div>
+          ) : (
+            <EmptyChartNote />
+          )}
+        </section>
+
+        {/* 04 — Cross-signals */}
+        <section>
+          <SectionHeader index="04" title="CROSS-SIGNALS" />
+          {dataset ? (
+            <div className="grid gap-4 lg:grid-cols-2">
+              <CorrelationPanel dataset={dataset} />
+              <AnomalyPanel dataset={dataset} />
+            </div>
+          ) : (
+            <EmptyChartNote />
+          )}
+        </section>
+
+        {/* 05 — AI analyst */}
+        <section>
+          <SectionHeader
+            index="05"
+            title="AI ANALYST"
+            right={
+              <span className="font-mono text-[10px] tracking-wider text-muted-foreground">
+                AUTOMATED SHIFT-REPORT READ
+              </span>
+            }
+          />
+          <AnalystPanel dataset={dataset} />
+        </section>
+      </main>
+
+      <footer className="border-t border-border bg-surface">
+        <div className="mx-auto max-w-6xl px-4 py-3 sm:px-6">
+          <p className="font-mono text-[10px] tracking-wider text-muted-foreground">
+            STRATA // ALL READINGS COMPUTED CLIENT-SIDE FROM THE UPLOADED LOG · AI READ RUNS SERVER-SIDE
+          </p>
+        </div>
+      </footer>
+
+      <HazardStrip />
+    </div>
+  );
+}
