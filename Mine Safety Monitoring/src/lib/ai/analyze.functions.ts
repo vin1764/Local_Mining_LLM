@@ -1,31 +1,11 @@
 import { createServerFn } from "@tanstack/react-start";
 
 import type { DatasetInsights, DatasetProfile } from "@/lib/dataset";
-import type { LocalAiErrorCode, ProviderStatus } from "./provider";
+import type { AiStatus, AnalyzeResult } from "./types";
 
 export type { DatasetInsights };
 
-/** Predictable response envelope for the AI analyst endpoint. */
-export type AnalyzeResult =
-  | {
-      ok: true;
-      insights: DatasetInsights;
-      meta: {
-        provider: string;
-        model: string;
-        durationMs: number;
-        /** Model sentences dropped for contradicting the data. */
-        droppedItems: number;
-        /** "code" when the model's summary contradicted the data and was replaced. */
-        summarySource: "model" | "code";
-      };
-    }
-  | {
-      ok: false;
-      error: { code: LocalAiErrorCode; message: string; hint?: string };
-    };
-
-export type AiStatus = ProviderStatus;
+export type { AiStatus, AnalyzeResult } from "./types";
 
 export const analyzeDataset = createServerFn({ method: "POST" })
   .inputValidator((input: DatasetProfile) => input)

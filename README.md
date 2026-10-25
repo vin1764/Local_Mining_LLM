@@ -1,8 +1,15 @@
 # Local LLM Mining
 
-**STRATA** is an offline mine-data dashboard. Upload a CSV and get trends,
-correlations, outliers and an AI shift report written by a local model
-(Qwen 2.5 1.5B via Ollama). After setup, no internet or cloud service is needed.
+**STRATA** is a mine-data dashboard. Upload a CSV and get trends,
+correlations, outliers and an AI shift report written by Qwen 2.5 1.5B running
+on your own device. No cloud AI is used.
+
+It comes in two editions:
+
+- **Web edition:** open the GitHub Pages link. The AI model runs inside your
+  browser (Chrome or Edge with WebGPU); you approve a one-time download of about
+  1 GB first. Deployed by `.github/workflows/pages.yml`.
+- **Local app:** run it on your computer with Ollama. It works fully offline.
 
 The app is in [`Mine Safety Monitoring/`](./Mine%20Safety%20Monitoring). See its
 [README](./Mine%20Safety%20Monitoring/README.md) for setup (Windows PowerShell

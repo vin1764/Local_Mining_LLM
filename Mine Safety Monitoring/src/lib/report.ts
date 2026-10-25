@@ -24,7 +24,7 @@ export function buildMarkdownReport(
     "",
     `- **File:** ${dataset.name}`,
     `- **Rows:** ${dataset.rowCount}`,
-    `- **Model:** ${analysis.model} (local, via Ollama)`,
+    `- **Model:** ${analysis.model} (ran on this device)`,
     `- **Analysed:** ${new Date(analysis.analysedAt).toLocaleString()}`,
     "",
     "## Summary",

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import {
   BrainCircuit,
@@ -27,7 +27,9 @@ import {
   type DatasetInsights,
   type DatasetProfile,
 } from "@/lib/dataset";
-import { analyzeDataset, getAiStatus, type AnalyzeResult } from "@/lib/ai/analyze.functions";
+import { aiClient } from "@/lib/ai/client";
+import type { AnalyzeResult, LoadProgress } from "@/lib/ai/types";
+import type { LocalAiErrorCode } from "@/lib/ai/provider";
 import {
   AI_DISCLAIMER,
   buildMarkdownReport,
@@ -91,7 +93,7 @@ const SEVERITY_LABEL: Record<DatasetInsights["findings"][number]["severity"], st
 function useAiStatus() {
   return useQuery({
     queryKey: ["ai-status"],
-    queryFn: () => getAiStatus(),
+    queryFn: () => aiClient.status(),
     refetchInterval: (q) => (q.state.data?.modelInstalled ? 60_000 : 10_000),
     refetchOnWindowFocus: true,
     retry: false,
@@ -102,16 +104,20 @@ function AiStatusBadge() {
   const status = useAiStatus();
   const s = status.data;
   const ready = !!s?.reachable && !!s?.modelInstalled;
+  const browser = aiClient.mode === "browser";
+  const modelName = (s?.model ?? "").replace(/-q\d.*$/i, "").replace(/-Instruct$/i, "");
   const label = status.isPending
     ? "CHECKING LOCAL AI"
     : ready
-      ? `LOCAL AI · ${s!.model.toUpperCase()}`
-      : s?.reachable
-        ? "MODEL NOT DOWNLOADED"
-        : "LOCAL AI OFFLINE";
+      ? `${browser ? "BROWSER AI" : "LOCAL AI"} · ${modelName.toUpperCase()}`
+      : s?.unsupported
+        ? "BROWSER AI UNSUPPORTED"
+        : s?.reachable
+          ? "MODEL NOT DOWNLOADED"
+          : "LOCAL AI OFFLINE";
   return (
     <span
-      title={s ? `${s.message}${s.hint ? ` ${s.hint}` : ""}` : "Checking the local Ollama server…"}
+      title={s ? `${s.message}${s.hint ? ` ${s.hint}` : ""}` : "Checking the local AI…"}
       className={`flex items-center gap-1.5 rounded-sm border px-2 py-1 ${
         ready
           ? "border-positive/50 bg-positive/10 text-positive"
@@ -132,9 +138,17 @@ class AnalystError extends Error {
   constructor(
     message: string,
     public readonly hint?: string,
+    public readonly code?: LocalAiErrorCode,
   ) {
     super(message);
   }
+}
+
+/** Download/load progress of an in-browser model (browser build only). */
+function useModelProgress(): LoadProgress | null {
+  const [p, setP] = useState<LoadProgress | null>(null);
+  useEffect(() => aiClient.subscribeProgress?.(setP), []);
+  return p;
 }
 
 function AnalystPanel({
@@ -150,6 +164,8 @@ function AnalystPanel({
   onAnalysis: (record: AnalysisRecord) => void;
 }) {
   const abortRef = useRef<AbortController | null>(null);
+  const queryClient = useQueryClient();
+  const progress = useModelProgress();
   const datasetRef = useRef(dataset);
   datasetRef.current = dataset;
 
@@ -158,8 +174,8 @@ function AnalystPanel({
       abortRef.current?.abort();
       const controller = new AbortController();
       abortRef.current = controller;
-      const res: AnalyzeResult = await analyzeDataset({ data: profile, signal: controller.signal });
-      if (!res.ok) throw new AnalystError(res.error.message, res.error.hint);
+      const res: AnalyzeResult = await aiClient.analyze(profile, controller.signal);
+      if (!res.ok) throw new AnalystError(res.error.message, res.error.hint, res.error.code);
       return {
         insights: res.insights,
         model: res.meta.model,
@@ -167,6 +183,9 @@ function AnalystPanel({
         durationMs: res.meta.durationMs,
         summarySource: res.meta.summarySource,
       } satisfies AnalysisRecord;
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: ["ai-status"] });
     },
     onSuccess: (record, vars) => {
       // Ignore answers for a dataset that is no longer on screen.
@@ -208,9 +227,23 @@ function AnalystPanel({
         <p className="mt-2 font-mono text-xs tracking-wider text-primary status-blink">
           PROCESSING {dataset.rowCount} ROWS × {dataset.numericNames.length} PARAMETERS…
         </p>
-        <p className="mt-1 font-mono text-[10px] text-muted-foreground">
-          Statistical profile compiled · local model reading now (the first run can take a minute)
-        </p>
+        {progress ? (
+          <div className="mx-auto mt-3 max-w-md">
+            <div className="h-1.5 overflow-hidden rounded-sm bg-surface-2">
+              <div
+                className="h-full bg-primary transition-[width]"
+                style={{ width: `${Math.round(progress.progress * 100)}%` }}
+              />
+            </div>
+            <p className="mt-1.5 font-mono text-[10px] text-muted-foreground">
+              LOADING MODEL {Math.round(progress.progress * 100)}% · {progress.text.slice(0, 90)}
+            </p>
+          </div>
+        ) : (
+          <p className="mt-1 font-mono text-[10px] text-muted-foreground">
+            Statistical profile compiled · local model reading now (the first run can take a minute)
+          </p>
+        )}
         <button
           onClick={() => {
             abortRef.current?.abort();
@@ -237,6 +270,30 @@ function AnalystPanel({
   if (run.isError) {
     const err = run.error;
     const hint = err instanceof AnalystError ? err.hint : undefined;
+    const code = err instanceof AnalystError ? err.code : undefined;
+    if (code === "consent_required" || code === "unsupported") {
+      return (
+        <div className="rounded-md border border-primary/40 bg-surface px-5 py-6">
+          <p className="flex items-center gap-2 font-mono text-xs text-primary">
+            <BrainCircuit className="size-4 shrink-0" />
+            {err.message}
+          </p>
+          {hint && <p className="mt-2 text-xs leading-relaxed text-foreground">{hint}</p>}
+          {code === "consent_required" && (
+            <button
+              onClick={() => {
+                aiClient.allowDownload?.();
+                start(dataset);
+              }}
+              className="mt-3 flex items-center gap-2 rounded-sm bg-primary px-3 py-1.5 font-mono text-[11px] font-semibold tracking-wider text-primary-foreground transition-colors hover:bg-primary/90"
+            >
+              <Download className="size-3.5" />
+              DOWNLOAD MODEL &amp; RUN ANALYSIS
+            </button>
+          )}
+        </div>
+      );
+    }
     return (
       <div className="rounded-md border border-negative/50 bg-negative/10 px-5 py-6">
         <p className="flex items-center gap-2 font-mono text-xs text-negative">
@@ -317,7 +374,7 @@ function AnalystPanel({
       </div>
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
         <p className="min-w-0 flex-1 font-mono text-[10px] leading-relaxed text-muted-foreground">
-          MODEL: {analysis.model} (LOCAL) · {new Date(analysis.analysedAt).toLocaleString()}
+          MODEL: {analysis.model} ({aiClient.mode === "browser" ? "IN YOUR BROWSER" : "LOCAL"}) · {new Date(analysis.analysedAt).toLocaleString()}
           {analysis.durationMs ? ` · ${(analysis.durationMs / 1000).toFixed(1)} s` : ""}
           <br />
           FINDING FACTS AND SEVERITY ARE COMPUTED BY THE APP; THE MODEL WRITES THE WORDING AND EXPLANATIONS.

@@ -26,6 +26,38 @@ Browser (React UI) ── http://127.0.0.1:8080 ──► Local app server (Node
 
 ---
 
+## Two editions
+
+| | **Local app** (`npm start`) | **Web edition** (GitHub Pages) |
+| --- | --- | --- |
+| Where the AI runs | Ollama on your computer | Inside the visitor's browser (WebLLM + WebGPU) |
+| Model | `qwen2.5:1.5b` via Ollama | Qwen 2.5 1.5B Instruct (MLC build) |
+| Install needed | Node.js + Ollama | None, just open the link |
+| Works offline | Yes, after setup | The model works offline once downloaded; the page itself needs a connection to open |
+| Browser support | Any modern browser | Recent Chrome or Edge on a desktop/laptop with a GPU |
+| First run | `ollama pull` (~1 GB) | One-time model download (~1 GB) after the visitor clicks **Download** |
+
+Both editions use the same dashboard, statistics, findings, severity rule and
+consistency checks (`src/lib/ai/analyst.ts`). Only the place the model runs differs.
+
+### Web edition (GitHub Pages)
+
+- **Build locally:** `npm run build:pages` writes a static site to `dist-pages/`.
+  Preview it with `npm run preview:pages` (http://127.0.0.1:8081).
+- **Deploy:** `.github/workflows/pages.yml` builds and publishes the site on
+  every push to `main`. One-time setup: in the GitHub repo, open
+  **Settings → Pages** and set **Source** to **GitHub Actions**.
+- **Model download:** nothing large downloads until the visitor clicks
+  **DOWNLOAD MODEL & RUN ANALYSIS**. The model comes from WebLLM's model hosts
+  (Hugging Face and the `mlc-ai` GitHub repos) and is cached in that browser.
+  The CSV and the statistics never leave the device.
+- **GPUs without 16-bit shader support** automatically get the `q4f32` build of
+  the same model (a little larger).
+- **Changing the model:** set `VITE_WEBLLM_MODEL` to any id from WebLLM's
+  prebuilt list when building, for example
+  `VITE_WEBLLM_MODEL=Qwen2.5-3B-Instruct-q4f16_1-MLC npm run build:pages`.
+- **Saved runs** are stored in the visitor's browser for the site's address.
+
 ## 1. One-time setup (needs internet)
 
 ### Windows (PowerShell) — primary

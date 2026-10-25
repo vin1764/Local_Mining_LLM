@@ -1,3 +1,7 @@
+import { ConfigError } from "./config-error";
+
+export { ConfigError };
+
 /**
  * Central configuration for the local AI layer. Every value comes from
  * environment variables (see .env.example) with offline-safe defaults.
@@ -20,10 +24,6 @@ export const DEFAULT_OLLAMA_BASE_URL = "http://127.0.0.1:11434";
 export const DEFAULT_OLLAMA_MODEL = "qwen2.5:1.5b";
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
-
-export class ConfigError extends Error {
-  override name = "ConfigError";
-}
 
 function readInt(
   raw: string | undefined,

@@ -12,7 +12,9 @@ export type LocalAiErrorCode =
   | "cancelled" // the user or browser cancelled the request
   | "bad_response" // the model answered but not in the required shape
   | "runtime_error" // the runtime reported an error
-  | "invalid_input"; // the request payload failed validation
+  | "invalid_input" // the request payload failed validation
+  | "consent_required" // browser mode: the model must be downloaded first
+  | "unsupported"; // browser mode: no WebGPU on this device
 
 export class LocalAiError extends Error {
   override name = "LocalAiError";
@@ -37,6 +39,10 @@ export interface ProviderStatus {
   installedModels: string[];
   message: string;
   hint?: string;
+  /** Browser mode: this device cannot run the model (no WebGPU). */
+  unsupported?: boolean;
+  /** Browser mode: approximate one-time download size. */
+  downloadSizeMB?: number;
 }
 
 /** A JSON schema object understood by the runtime's structured-output mode. */
