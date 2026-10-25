@@ -31,6 +31,8 @@ export interface Dataset {
   rows: Record<string, number | string | null>[];
   numericNames: string[];
   categoryNames: string[];
+  /** Original CSV text, kept so a run can be saved locally and reloaded. */
+  sourceText: string;
 }
 
 export interface ChartRow {
@@ -67,6 +69,8 @@ export interface ProfileColumn {
   trendPct?: number;
   missingPct?: number;
   anomalyCount?: number;
+  /** Largest |z-score| of any value in this column. */
+  maxAbsZ?: number;
   distinct?: number;
 }
 
@@ -74,6 +78,8 @@ export interface DatasetProfile {
   name: string;
   rowCount: number;
   timeColumn: string | null;
+  /** First and last timestamp after sorting by the time column. */
+  timeRange: { start: string; end: string } | null;
   columns: ProfileColumn[];
   correlations: { a: string; b: string; r: number }[];
   anomalies: { column: string; label: string; value: number; z: number }[];
@@ -85,8 +91,12 @@ export interface DatasetInsights {
   summary: string;
   findings: {
     parameter: string;
+    /** Measured facts, written by code from the computed statistics. */
     observation: string;
+    /** Statistical severity, assigned by a fixed rule (see README). */
     severity: "normal" | "watch" | "critical";
+    /** The model's possible explanation (a hypothesis, not a measurement). */
+    interpretation?: string;
   }[];
   recommendations: string[];
 }
@@ -116,6 +126,8 @@ function isTimeLike(v: unknown): boolean {
 export function inferUnit(name: string): string {
   const n = name.toLowerCase();
   if (/pct|percent|%/.test(n)) return "%";
+  if (/ppm/.test(n)) return "ppm";
+  if (/m3_?s|m³\/s|cumecs/.test(n)) return "m³/s";
   if (/(^|_)(kwh|energy)/.test(n)) return "kWh";
   if (/tph|tonn/.test(n)) return "t/h";
   if (/(^|_)kl|water/.test(n)) return "kL";
@@ -189,6 +201,19 @@ export function buildDataset(text: string, name: string): Dataset {
     rows.push(row);
   }
 
+  // Sort by time so trends, first/last values and charts follow the real
+  // timeline even when the CSV is not in order. Unparseable times go last.
+  if (timeColumn) {
+    const t = (r: Record<string, number | string | null>) => {
+      const ms = Date.parse(String(r[timeColumn] ?? ""));
+      return Number.isNaN(ms) ? Number.POSITIVE_INFINITY : ms;
+    };
+    rows.sort((a, b) => {
+      const d = t(a) - t(b);
+      return Number.isNaN(d) ? 0 : d;
+    });
+  }
+
   const numericNames: string[] = [];
   const categoryNames: string[] = [];
   const columns: ColumnMeta[] = [];
@@ -214,6 +239,7 @@ export function buildDataset(text: string, name: string): Dataset {
     rows,
     numericNames,
     categoryNames,
+    sourceText: text,
   };
 }
 
@@ -394,6 +420,15 @@ export function buildProfile(dataset: Dataset): DatasetProfile {
       base.trendPct = Number(c.stats.trendPct.toFixed(1));
       base.missingPct = Number(c.stats.missingPct.toFixed(1));
       base.anomalyCount = c.stats.anomalyCount;
+      const { mean, std } = c.stats;
+      let maxAbsZ = 0;
+      if (std > 0) {
+        for (const r of dataset.rows) {
+          const v = r[c.name];
+          if (typeof v === "number") maxAbsZ = Math.max(maxAbsZ, Math.abs((v - mean) / std));
+        }
+      }
+      base.maxAbsZ = Number(maxAbsZ.toFixed(2));
     }
     return base;
   });
@@ -402,17 +437,27 @@ export function buildProfile(dataset: Dataset): DatasetProfile {
     dataset.columns.map((c) => {
       const v = row[c.name];
       return `${c.name}=${v === null ? "∅" : v}`;
-    }).join(" | ");
+    }).join(" | ").slice(0, 1000);
+
+  let timeRange: DatasetProfile["timeRange"] = null;
+  const tc = dataset.timeColumn;
+  if (tc) {
+    const labels = dataset.rows
+      .map((r) => r[tc])
+      .filter((v): v is string => typeof v === "string" && !Number.isNaN(Date.parse(v)));
+    if (labels.length > 0) timeRange = { start: labels[0]!, end: labels[labels.length - 1]! };
+  }
 
   return {
     name: dataset.name,
     rowCount: dataset.rowCount,
     timeColumn: dataset.timeColumn,
+    timeRange,
     columns,
     correlations: computeCorrelations(dataset),
     anomalies: computeAnomalies(dataset).map((a) => ({
       column: a.column,
-      label: a.label,
+      label: a.label.slice(0, 100),
       value: a.value,
       z: a.z,
     })),

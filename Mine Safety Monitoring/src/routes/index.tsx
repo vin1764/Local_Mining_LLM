@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
-import { useMutation } from "@tanstack/react-query";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import {
   BrainCircuit,
   CircleDot,
   Cpu,
+  Download,
   GitBranch,
   HardHat,
   RefreshCw,
@@ -14,8 +15,10 @@ import {
 } from "lucide-react";
 
 import { UploadZone } from "@/components/upload-zone";
+import { SavedRunsPanel } from "@/components/saved-runs";
 import { EmptyChartNote, MiniChart, SectionHeader, TrendConsole } from "@/components/charts";
 import {
+  buildDataset,
   buildProfile,
   computeAnomalies,
   formatValue,
@@ -24,7 +27,15 @@ import {
   type DatasetInsights,
   type DatasetProfile,
 } from "@/lib/dataset";
-import { analyzeDataset } from "@/lib/ai/analyze.functions";
+import { analyzeDataset, getAiStatus, type AnalyzeResult } from "@/lib/ai/analyze.functions";
+import {
+  AI_DISCLAIMER,
+  buildMarkdownReport,
+  downloadText,
+  reportFileName,
+  type AnalysisRecord,
+} from "@/lib/report";
+import type { SavedRun } from "@/lib/storage/runs";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -33,7 +44,7 @@ export const Route = createFileRoute("/")({
       {
         name: "description",
         content:
-          "Upload mine-site CSV logs and get multi-parameter trends, correlations, outlier flags and an AI analyst read in one dashboard.",
+          "Upload mine-site CSV logs and get multi-parameter trends, correlations, outlier flags and a local AI analyst read in one offline dashboard.",
       },
       { property: "og:title", content: "STRATA — Mine Operations Dashboard" },
       {
@@ -75,21 +86,109 @@ const SEVERITY_LABEL: Record<DatasetInsights["findings"][number]["severity"], st
   critical: "CRITICAL",
 };
 
+/* ---------------- Local AI status ---------------- */
+
+function useAiStatus() {
+  return useQuery({
+    queryKey: ["ai-status"],
+    queryFn: () => getAiStatus(),
+    refetchInterval: (q) => (q.state.data?.modelInstalled ? 60_000 : 10_000),
+    refetchOnWindowFocus: true,
+    retry: false,
+  });
+}
+
+function AiStatusBadge() {
+  const status = useAiStatus();
+  const s = status.data;
+  const ready = !!s?.reachable && !!s?.modelInstalled;
+  const label = status.isPending
+    ? "CHECKING LOCAL AI"
+    : ready
+      ? `LOCAL AI · ${s!.model.toUpperCase()}`
+      : s?.reachable
+        ? "MODEL NOT DOWNLOADED"
+        : "LOCAL AI OFFLINE";
+  return (
+    <span
+      title={s ? `${s.message}${s.hint ? ` ${s.hint}` : ""}` : "Checking the local Ollama server…"}
+      className={`flex items-center gap-1.5 rounded-sm border px-2 py-1 ${
+        ready
+          ? "border-positive/50 bg-positive/10 text-positive"
+          : status.isPending
+            ? "border-border bg-surface-2 text-muted-foreground"
+            : "border-warning/50 bg-warning/10 text-warning"
+      }`}
+    >
+      <Cpu className="size-3" />
+      {label}
+    </span>
+  );
+}
+
 /* ---------------- AI analyst panel ---------------- */
 
-function AnalystPanel({ dataset }: { dataset: Dataset | null }) {
+class AnalystError extends Error {
+  constructor(
+    message: string,
+    public readonly hint?: string,
+  ) {
+    super(message);
+  }
+}
+
+function AnalystPanel({
+  dataset,
+  analysis,
+  runKey,
+  onAnalysis,
+}: {
+  dataset: Dataset | null;
+  analysis: AnalysisRecord | null;
+  /** Increments whenever a fresh automatic run should start. */
+  runKey: number;
+  onAnalysis: (record: AnalysisRecord) => void;
+}) {
+  const abortRef = useRef<AbortController | null>(null);
+  const datasetRef = useRef(dataset);
+  datasetRef.current = dataset;
+
   const run = useMutation({
-    mutationFn: (profile: DatasetProfile) => analyzeDataset({ data: profile }),
+    mutationFn: async ({ profile }: { profile: DatasetProfile; dataset: Dataset }) => {
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
+      const res: AnalyzeResult = await analyzeDataset({ data: profile, signal: controller.signal });
+      if (!res.ok) throw new AnalystError(res.error.message, res.error.hint);
+      return {
+        insights: res.insights,
+        model: res.meta.model,
+        analysedAt: new Date().toISOString(),
+        durationMs: res.meta.durationMs,
+        summarySource: res.meta.summarySource,
+      } satisfies AnalysisRecord;
+    },
+    onSuccess: (record, vars) => {
+      // Ignore answers for a dataset that is no longer on screen.
+      if (vars.dataset === datasetRef.current) onAnalysis(record);
+    },
   });
 
-  // Auto-run whenever a fresh dataset lands.
+  const start = (d: Dataset) => run.mutate({ profile: buildProfile(d), dataset: d });
+
+  // A new dataset cancels any analysis still running for the old one.
   useEffect(() => {
+    abortRef.current?.abort();
     run.reset();
-    if (dataset) run.mutate(buildProfile(dataset));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dataset]);
 
-  const insights = run.data;
+  useEffect(() => {
+    if (runKey > 0 && datasetRef.current) start(datasetRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runKey]);
+
+  useEffect(() => () => abortRef.current?.abort(), []);
 
   if (!dataset) {
     return (
@@ -110,71 +209,131 @@ function AnalystPanel({ dataset }: { dataset: Dataset | null }) {
           PROCESSING {dataset.rowCount} ROWS × {dataset.numericNames.length} PARAMETERS…
         </p>
         <p className="mt-1 font-mono text-[10px] text-muted-foreground">
-          Statistical profile compiled · analyst model reading now
-        </p>
-      </div>
-    );
-  }
-
-  if (run.isError) {
-    return (
-      <div className="rounded-md border border-negative/50 bg-negative/10 px-5 py-6">
-        <p className="flex items-center gap-2 font-mono text-xs text-negative">
-          <TriangleAlert className="size-4 shrink-0" />
-          {run.error instanceof Error ? run.error.message : "Analyst call failed."}
+          Statistical profile compiled · local model reading now (the first run can take a minute)
         </p>
         <button
-          onClick={() => run.mutate(buildProfile(dataset))}
-          className="mt-3 flex items-center gap-2 rounded-sm border border-border bg-surface px-3 py-1.5 font-mono text-[11px] tracking-wider text-foreground transition-colors hover:border-primary/60"
+          onClick={() => {
+            abortRef.current?.abort();
+            run.reset();
+          }}
+          className="mt-3 rounded-sm border border-border bg-surface-2 px-3 py-1 font-mono text-[10px] tracking-wider text-muted-foreground transition-colors hover:border-primary/60 hover:text-foreground"
         >
-          <RefreshCw className="size-3.5" />
-          RETRY ANALYSIS
+          CANCEL
         </button>
       </div>
     );
   }
 
-  if (!insights) return null;
+  const rerunButton = (label: string) => (
+    <button
+      onClick={() => start(dataset)}
+      className="flex items-center gap-2 rounded-sm border border-border bg-surface px-3 py-1.5 font-mono text-[11px] tracking-wider text-foreground transition-colors hover:border-primary/60"
+    >
+      <RefreshCw className="size-3.5" />
+      {label}
+    </button>
+  );
+
+  if (run.isError) {
+    const err = run.error;
+    const hint = err instanceof AnalystError ? err.hint : undefined;
+    return (
+      <div className="rounded-md border border-negative/50 bg-negative/10 px-5 py-6">
+        <p className="flex items-center gap-2 font-mono text-xs text-negative">
+          <TriangleAlert className="size-4 shrink-0" />
+          {err instanceof Error ? err.message : "Analyst call failed."}
+        </p>
+        {hint && <p className="mt-2 text-xs leading-relaxed text-foreground">{hint}</p>}
+        <div className="mt-3">{rerunButton("RETRY ANALYSIS")}</div>
+      </div>
+    );
+  }
+
+  if (!analysis) {
+    return (
+      <div className="rounded-md border border-dashed border-border bg-surface px-5 py-6 text-center">
+        <BrainCircuit className="mx-auto size-7 text-muted-foreground" />
+        <p className="mt-2 font-mono text-xs tracking-wider text-muted-foreground">
+          NO ANALYSIS FOR THIS DATASET YET
+        </p>
+        <div className="mt-3 flex justify-center">{rerunButton("RUN LOCAL ANALYSIS")}</div>
+      </div>
+    );
+  }
+
+  const { insights } = analysis;
 
   return (
-    <div className="grid gap-4 lg:grid-cols-[1.1fr_1fr]">
-      <div className="rounded-md border border-primary/40 bg-surface p-5">
-        <p className="font-mono text-[10px] tracking-wider text-primary">HEADLINE READ</p>
-        <p className="font-display text-3xl leading-tight tracking-wide text-foreground text-glow">
-          {insights.headline}
-        </p>
-        <p className="mt-3 text-sm leading-relaxed text-muted-foreground">{insights.summary}</p>
-      </div>
-      <div className="grid gap-3">
-        <div className="grid gap-2">
-          {insights.findings.map((f, i) => (
-            <div
-              key={i}
-              className="flex items-start gap-3 rounded-md border border-border bg-surface px-3 py-2"
-            >
-              <span
-                className={`mt-0.5 shrink-0 rounded-sm border px-1.5 py-0.5 font-mono text-[9px] tracking-wider ${SEVERITY_STYLES[f.severity]}`}
+    <div className="grid gap-3">
+      <div className="grid gap-4 lg:grid-cols-[1.1fr_1fr]">
+        <div className="rounded-md border border-primary/40 bg-surface p-5">
+          <p className="font-mono text-[10px] tracking-wider text-primary">HEADLINE READ</p>
+          <p className="font-display text-3xl leading-tight tracking-wide text-foreground text-glow">
+            {insights.headline}
+          </p>
+          <p className="mt-3 text-sm leading-relaxed text-muted-foreground">{insights.summary}</p>
+        </div>
+        <div className="grid gap-3">
+          <div className="grid gap-2">
+            {insights.findings.map((f, i) => (
+              <div
+                key={i}
+                className="flex items-start gap-3 rounded-md border border-border bg-surface px-3 py-2"
               >
-                {SEVERITY_LABEL[f.severity]}
-              </span>
-              <p className="min-w-0 text-xs leading-relaxed text-foreground">
-                <span className="font-mono font-semibold">{prettyName(f.parameter)}</span>
-                <span className="text-muted-foreground"> — {f.observation}</span>
-              </p>
-            </div>
-          ))}
-        </div>
-        <div className="rounded-md border border-border bg-surface-2 p-3">
-          <p className="font-mono text-[10px] tracking-wider text-primary">SHIFT ACTIONS</p>
-          <ol className="mt-1.5 grid gap-1">
-            {insights.recommendations.map((rec, i) => (
-              <li key={i} className="flex gap-2 text-xs text-foreground">
-                <span className="font-mono text-muted-foreground">{String(i + 1).padStart(2, "0")}</span>
-                {rec}
-              </li>
+                <span
+                  className={`mt-0.5 shrink-0 rounded-sm border px-1.5 py-0.5 font-mono text-[9px] tracking-wider ${SEVERITY_STYLES[f.severity]}`}
+                >
+                  {SEVERITY_LABEL[f.severity]}
+                </span>
+                <div className="min-w-0 text-xs leading-relaxed text-foreground">
+                  <p>
+                    <span className="font-mono font-semibold">{prettyName(f.parameter)}</span>
+                    <span className="text-muted-foreground"> — {f.observation}</span>
+                  </p>
+                  {f.interpretation && (
+                    <p className="mt-0.5 italic text-muted-foreground">
+                      <span className="font-mono text-[9px] not-italic tracking-wider text-primary">
+                        POSSIBLE EXPLANATION ·{" "}
+                      </span>
+                      {f.interpretation}
+                    </p>
+                  )}
+                </div>
+              </div>
             ))}
-          </ol>
+          </div>
+          <div className="rounded-md border border-border bg-surface-2 p-3">
+            <p className="font-mono text-[10px] tracking-wider text-primary">SHIFT ACTIONS</p>
+            <ol className="mt-1.5 grid gap-1">
+              {insights.recommendations.map((rec, i) => (
+                <li key={i} className="flex gap-2 text-xs text-foreground">
+                  <span className="font-mono text-muted-foreground">{String(i + 1).padStart(2, "0")}</span>
+                  {rec}
+                </li>
+              ))}
+            </ol>
+          </div>
         </div>
+      </div>
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+        <p className="min-w-0 flex-1 font-mono text-[10px] leading-relaxed text-muted-foreground">
+          MODEL: {analysis.model} (LOCAL) · {new Date(analysis.analysedAt).toLocaleString()}
+          {analysis.durationMs ? ` · ${(analysis.durationMs / 1000).toFixed(1)} s` : ""}
+          <br />
+          FINDING FACTS AND SEVERITY ARE COMPUTED BY THE APP; THE MODEL WRITES THE WORDING AND EXPLANATIONS.
+          {analysis.summarySource === "code" &&
+            " THE MODEL'S SUMMARY CONTRADICTED THE DATA, SO THE HEADLINE AND SUMMARY ABOVE WERE WRITTEN FROM THE STATISTICS."}
+          <br />
+          {AI_DISCLAIMER}
+        </p>
+        <button
+          onClick={() => downloadText(reportFileName(dataset.name), buildMarkdownReport(dataset, analysis))}
+          className="flex items-center gap-2 rounded-sm border border-border bg-surface px-3 py-1.5 font-mono text-[11px] tracking-wider text-foreground transition-colors hover:border-primary/60"
+        >
+          <Download className="size-3.5" />
+          EXPORT REPORT
+        </button>
+        {rerunButton("RE-RUN")}
       </div>
     </div>
   );
@@ -293,11 +452,40 @@ function Dashboard() {
   const [dataset, setDataset] = useState<Dataset | null>(null);
   const [selected, setSelected] = useState<string[]>([]);
   const [normalized, setNormalized] = useState(false);
+  const [analysis, setAnalysis] = useState<AnalysisRecord | null>(null);
+  const [savedRunId, setSavedRunId] = useState<string | null>(null);
+  const [runKey, setRunKey] = useState(0);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
-  const handleDataset = (d: Dataset) => {
+  const showDataset = (d: Dataset) => {
     setDataset(d);
     setSelected(d.numericNames.slice(0, 5));
     setNormalized(false);
+    setLoadError(null);
+  };
+
+  // Fresh upload or demo: analyse automatically, as before.
+  const handleDataset = (d: Dataset) => {
+    showDataset(d);
+    setAnalysis(null);
+    setSavedRunId(null);
+    setRunKey((k) => k + 1);
+  };
+
+  // Saved run: show the stored analysis without calling the model again.
+  const handleLoadRun = (run: SavedRun) => {
+    try {
+      showDataset(buildDataset(run.csvText, run.name));
+    } catch (e) {
+      setLoadError(e instanceof Error ? e.message : "Could not read the saved run.");
+      return;
+    }
+    setSavedRunId(run.id);
+    if (run.insights && run.model && run.analysedAt) {
+      setAnalysis({ insights: run.insights, model: run.model, analysedAt: run.analysedAt });
+    } else {
+      setAnalysis(null);
+    }
   };
 
   const toggle = (name: string) =>
@@ -337,7 +525,8 @@ function Dashboard() {
               </p>
             </div>
           </div>
-          <div className="ml-auto flex items-center gap-2 font-mono text-[10px] tracking-wider">
+          <div className="ml-auto flex flex-wrap items-center gap-2 font-mono text-[10px] tracking-wider">
+            <AiStatusBadge />
             <span
               className={`flex items-center gap-1.5 rounded-sm border px-2 py-1 ${
                 dataset
@@ -375,6 +564,24 @@ function Dashboard() {
               <StatBlock label="OUTLIERS TOTAL" value={String(stats.outlierTotal)} />
             </div>
           )}
+
+          {loadError && (
+            <p className="mt-3 flex items-center gap-2 font-mono text-xs text-negative">
+              <TriangleAlert className="size-3.5" />
+              {loadError}
+            </p>
+          )}
+
+          <SavedRunsPanel
+            dataset={dataset}
+            analysis={analysis}
+            savedRunId={savedRunId}
+            onSaved={setSavedRunId}
+            onLoad={handleLoadRun}
+            onDeleted={(id) => {
+              if (id === savedRunId) setSavedRunId(null);
+            }}
+          />
         </section>
 
         {/* 02 — Trend console */}
@@ -446,18 +653,18 @@ function Dashboard() {
             title="AI ANALYST"
             right={
               <span className="font-mono text-[10px] tracking-wider text-muted-foreground">
-                AUTOMATED SHIFT-REPORT READ
+                LOCAL MODEL · RUNS ON THIS COMPUTER
               </span>
             }
           />
-          <AnalystPanel dataset={dataset} />
+          <AnalystPanel dataset={dataset} analysis={analysis} runKey={runKey} onAnalysis={setAnalysis} />
         </section>
       </main>
 
       <footer className="border-t border-border bg-surface">
         <div className="mx-auto max-w-6xl px-4 py-3 sm:px-6">
           <p className="font-mono text-[10px] tracking-wider text-muted-foreground">
-            STRATA // ALL READINGS COMPUTED CLIENT-SIDE FROM THE UPLOADED LOG · AI READ RUNS SERVER-SIDE
+            STRATA // ALL READINGS COMPUTED IN YOUR BROWSER FROM THE UPLOADED LOG · AI READ BY A LOCAL MODEL ON THIS COMPUTER · NOTHING LEAVES THIS MACHINE
           </p>
         </div>
       </footer>

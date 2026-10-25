@@ -1,0 +1,65 @@
+/**
+ * Provider-neutral contract for local inference. React components never talk
+ * to a model runtime directly; they call server functions that use this.
+ * Ollama is the first implementation (see ollama.server.ts).
+ */
+
+export type LocalAiErrorCode =
+  | "config" // bad environment configuration
+  | "unreachable" // runtime not running / connection refused
+  | "model_missing" // runtime is up but the model is not downloaded
+  | "timeout" // took longer than the configured limit
+  | "cancelled" // the user or browser cancelled the request
+  | "bad_response" // the model answered but not in the required shape
+  | "runtime_error" // the runtime reported an error
+  | "invalid_input"; // the request payload failed validation
+
+export class LocalAiError extends Error {
+  override name = "LocalAiError";
+  constructor(
+    public readonly code: LocalAiErrorCode,
+    message: string,
+    public readonly hint?: string,
+  ) {
+    super(message);
+  }
+}
+
+export interface ProviderStatus {
+  provider: string;
+  model: string;
+  baseUrl: string;
+  /** Runtime answered on its API. */
+  reachable: boolean;
+  /** Configured model is downloaded and available. */
+  modelInstalled: boolean;
+  runtimeVersion: string | null;
+  installedModels: string[];
+  message: string;
+  hint?: string;
+}
+
+/** A JSON schema object understood by the runtime's structured-output mode. */
+export type JsonSchema = Record<string, unknown>;
+
+export interface StructuredRequest {
+  system: string;
+  prompt: string;
+  /** JSON schema the runtime should constrain its output to. */
+  jsonSchema: JsonSchema;
+  signal?: AbortSignal;
+}
+
+export interface StructuredResult {
+  /** Parsed JSON value returned by the model (validate before use). */
+  value: unknown;
+  model: string;
+  durationMs: number;
+}
+
+export interface LocalInferenceProvider {
+  readonly name: string;
+  readonly model: string;
+  status(signal?: AbortSignal): Promise<ProviderStatus>;
+  generateStructured(request: StructuredRequest): Promise<StructuredResult>;
+}

@@ -1,0 +1,564 @@
+/**
+ * Everything about the AI shift report that is independent of the model
+ * runtime: input validation, the facts sheet sent to the model, the output
+ * JSON schema, and the checks applied to what comes back.
+ *
+ * Division of labour (small local models misquote numbers):
+ * - Code computes every number, writes each finding's measured facts and
+ *   assigns its severity with a fixed rule.
+ * - The model writes the headline, summary, a hedged explanation per
+ *   finding and the recommendations.
+ * - Model text that contradicts the computed direction of a trend is
+ *   rejected; if it keeps happening, code writes the summary instead.
+ */
+import { z } from "zod";
+
+import type {
+  DatasetInsights,
+  DatasetProfile,
+  ProfileColumn,
+} from "@/lib/dataset";
+
+type Severity = DatasetInsights["findings"][number]["severity"];
+
+/* ============================ Input validation ============================ */
+
+const finite = z.number().finite();
+const shortText = z.string().max(300);
+
+export const profileSchema = z.object({
+  name: z.string().min(1).max(260),
+  rowCount: z.number().int().nonnegative().max(10_000_000),
+  timeColumn: shortText.nullable(),
+  timeRange: z.object({ start: shortText, end: shortText }).nullable(),
+  columns: z
+    .array(
+      z.object({
+        name: z.string().min(1).max(200),
+        type: z.enum(["number", "time", "category"]),
+        unit: z.string().max(20),
+        min: finite.optional(),
+        max: finite.optional(),
+        mean: finite.optional(),
+        std: finite.optional(),
+        first: finite.optional(),
+        last: finite.optional(),
+        trendPct: finite.optional(),
+        missingPct: finite.optional(),
+        anomalyCount: z.number().int().nonnegative().optional(),
+        maxAbsZ: finite.optional(),
+        distinct: z.number().int().nonnegative().optional(),
+      }),
+    )
+    .min(1)
+    .max(500),
+  correlations: z
+    .array(z.object({ a: shortText, b: shortText, r: finite }))
+    .max(50),
+  anomalies: z
+    .array(
+      z.object({
+        column: shortText,
+        label: shortText,
+        value: finite,
+        z: finite,
+      }),
+    )
+    .max(100),
+  samples: z.object({
+    first: z.array(z.string().max(4000)).max(10),
+    last: z.array(z.string().max(4000)).max(10),
+  }),
+});
+
+/* ============================ Deterministic findings ============================ */
+
+export const MAX_PROMPT_COLUMNS = 20;
+export const MAX_FINDINGS = 6;
+
+/** Below this absolute % change a parameter is described as flat. */
+export const FLAT_TREND_PCT = 2;
+
+/**
+ * Statistical severity rule (not a safety rating):
+ * - critical: a value at |z| >= 4, or a first-to-last-quarter change of 50% or more
+ * - watch:    any |z| >= 3 outlier, a change of 10% or more, or 10%+ missing values
+ * - normal:   otherwise
+ */
+export function severityFor(c: ProfileColumn): Severity {
+  const trend = Math.abs(c.trendPct ?? 0);
+  const maxZ = c.maxAbsZ ?? 0;
+  if (maxZ >= 4 || trend >= 50) return "critical";
+  if ((c.anomalyCount ?? 0) > 0 || trend >= 10 || (c.missingPct ?? 0) >= 10)
+    return "watch";
+  return "normal";
+}
+
+function num(v: number | undefined): string {
+  if (v === undefined) return "n/a";
+  const abs = Math.abs(v);
+  if (abs !== 0 && (abs >= 1e6 || abs < 1e-3)) return v.toExponential(3);
+  return String(Number(v.toFixed(3)));
+}
+
+function withUnit(v: number | undefined, unit: string): string {
+  return unit ? `${num(v)} ${unit}` : num(v);
+}
+
+export function direction(
+  trendPct: number | undefined,
+): "rose" | "fell" | "flat" {
+  const t = trendPct ?? 0;
+  if (Math.abs(t) < FLAT_TREND_PCT) return "flat";
+  return t > 0 ? "rose" : "fell";
+}
+
+/** One plain-English sentence of measured facts for a numeric parameter. */
+export function describeColumn(
+  c: ProfileColumn,
+  profile: DatasetProfile,
+): string {
+  const span = profile.timeRange
+    ? "from the first to the last quarter of the period"
+    : "from the first to the last quarter of the rows";
+  const dir = direction(c.trendPct);
+  const movement =
+    dir === "flat"
+      ? `Roughly flat ${span} (${c.trendPct && c.trendPct >= 0 ? "+" : ""}${num(c.trendPct)}%)`
+      : `${dir === "rose" ? "Rose" : "Fell"} ${num(Math.abs(c.trendPct ?? 0))}% ${span}`;
+  const range = `ranged ${num(c.min)} to ${withUnit(c.max, c.unit)} (mean ${withUnit(c.mean, c.unit)})`;
+
+  const n = c.anomalyCount ?? 0;
+  let outliers = "no 3-sigma outliers";
+  if (n > 0) {
+    const worst = profile.anomalies
+      .filter((a) => a.column === c.name)
+      .sort((a, b) => Math.abs(b.z) - Math.abs(a.z))[0];
+    outliers = `${n} outlier${n === 1 ? "" : "s"} at |z| ≥ 3`;
+    if (worst)
+      outliers += `, largest ${withUnit(worst.value, c.unit)} at ${worst.label} (z = ${num(worst.z)})`;
+  }
+  const missing =
+    (c.missingPct ?? 0) > 0 ? `; ${num(c.missingPct)}% of values missing` : "";
+  return `${movement}; ${range}; ${outliers}${missing}.`;
+}
+
+const SEVERITY_RANK: Record<Severity, number> = {
+  critical: 2,
+  watch: 1,
+  normal: 0,
+};
+
+export interface PlannedFinding {
+  parameter: string;
+  severity: Severity;
+  observation: string;
+}
+
+/** Choose which parameters get a finding and write their measured facts. */
+export function planFindings(profile: DatasetProfile): PlannedFinding[] {
+  return profile.columns
+    .filter((c) => c.type === "number")
+    .map((c) => ({ c, severity: severityFor(c) }))
+    .sort(
+      (a, b) =>
+        SEVERITY_RANK[b.severity] - SEVERITY_RANK[a.severity] ||
+        Math.abs(b.c.trendPct ?? 0) - Math.abs(a.c.trendPct ?? 0),
+    )
+    .slice(0, MAX_FINDINGS)
+    .map(({ c, severity }) => ({
+      parameter: c.name,
+      severity,
+      observation: describeColumn(c, profile),
+    }));
+}
+
+/** Summary and headline written by code, used when the model's text is unreliable. */
+export function fallbackSummary(
+  profile: DatasetProfile,
+  planned: PlannedFinding[],
+): { headline: string; summary: string } {
+  const numeric = profile.columns.filter((c) => c.type === "number");
+  const flagged = planned.filter((f) => f.severity !== "normal").length;
+  const period = profile.timeRange
+    ? `from ${profile.timeRange.start} to ${profile.timeRange.end}`
+    : "in file order";
+  const moves = [...numeric]
+    .filter((c) => direction(c.trendPct) !== "flat")
+    .sort((a, b) => Math.abs(b.trendPct ?? 0) - Math.abs(a.trendPct ?? 0))
+    .slice(0, 3)
+    .map(
+      (c) =>
+        `${c.name} ${direction(c.trendPct)} ${num(Math.abs(c.trendPct ?? 0))}%`,
+    );
+  const outliers = numeric.reduce((s, c) => s + (c.anomalyCount ?? 0), 0);
+  const summary = [
+    `${profile.rowCount} rows ${period} across ${numeric.length} numeric parameters.`,
+    moves.length > 0
+      ? `Largest movements: ${moves.join(", ")}.`
+      : "No parameter moved by more than 2%.",
+    `${outliers} value${outliers === 1 ? "" : "s"} flagged as 3-sigma outliers.`,
+  ].join(" ");
+  const headline =
+    flagged === 0
+      ? "All parameters stable over the period"
+      : `${flagged} of ${numeric.length} parameters flagged for review`;
+  return { headline, summary };
+}
+
+/* ============================ Prompt ============================ */
+
+export const SYSTEM_INSTRUCTIONS = [
+  "You are STRATA's mine-data analyst: a careful mining engineer writing a short shift report.",
+  "You receive a FACTS sheet computed by software from one CSV file. It is the only evidence you have.",
+  "Rules:",
+  "- Use only numbers that appear in the FACTS sheet. Never invent values, limits, thresholds or units.",
+  "- Copy directions exactly: if FACTS says a parameter ROSE, never say it fell, and the reverse.",
+  "- Name parameters exactly as written in the FACTS sheet (for example ore_grade_pct). Do not guess what abbreviations stand for.",
+  "- Only outliers have dates. Do not attach dates to minimums, maximums or means.",
+  "- Keep units and the time period when you quote a number.",
+  "- Measured facts are already written for you. Notes must not repeat numbers: give a possible explanation or what to check, starting with 'May', 'Possibly' or 'Could'.",
+  "- Correlation is not causation. Never claim one parameter causes another.",
+  "- No safety limits were provided, so never say a value breaches a limit or is unsafe.",
+  "- If the evidence is too thin for a conclusion, say so.",
+  "Write clear, direct English like a daily shift report. No fluff.",
+].join("\n");
+
+function rankColumns(columns: ProfileColumn[]): {
+  kept: ProfileColumn[];
+  omitted: string[];
+} {
+  const numeric = columns.filter((c) => c.type === "number");
+  if (numeric.length <= MAX_PROMPT_COLUMNS)
+    return { kept: numeric, omitted: [] };
+  const ranked = [...numeric].sort(
+    (a, b) =>
+      SEVERITY_RANK[severityFor(b)] - SEVERITY_RANK[severityFor(a)] ||
+      Math.abs(b.trendPct ?? 0) - Math.abs(a.trendPct ?? 0),
+  );
+  const keep = new Set(ranked.slice(0, MAX_PROMPT_COLUMNS).map((c) => c.name));
+  return {
+    kept: numeric.filter((c) => keep.has(c.name)),
+    omitted: numeric.filter((c) => !keep.has(c.name)).map((c) => c.name),
+  };
+}
+
+/** Render the deterministic profile as a compact, readable facts sheet. */
+export function buildFactsSheet(profile: DatasetProfile): string {
+  const lines: string[] = [];
+  lines.push(`FILE: ${profile.name}`);
+  lines.push(`ROWS: ${profile.rowCount}`);
+  if (profile.timeColumn && profile.timeRange) {
+    lines.push(
+      `PERIOD: ${profile.timeRange.start} to ${profile.timeRange.end} (rows sorted by ${profile.timeColumn})`,
+    );
+  } else {
+    lines.push("PERIOD: unknown (no time column; rows are in file order)");
+  }
+
+  const { kept, omitted } = rankColumns(profile.columns);
+  lines.push("");
+  lines.push(
+    "PARAMETERS (direction compares the mean of the last quarter of rows with the first quarter):",
+  );
+  if (kept.length === 0) lines.push("- none");
+  for (const c of kept) {
+    const dir = direction(c.trendPct).toUpperCase();
+    const unit = c.unit ? `unit ${c.unit}` : "unit not stated";
+    lines.push(`- ${c.name} (${unit}): ${dir}. ${describeColumn(c, profile)}`);
+  }
+  if (omitted.length > 0) {
+    lines.push(
+      `- (${omitted.length} more numeric columns not shown: ${omitted.slice(0, 15).join(", ")}${omitted.length > 15 ? ", ..." : ""})`,
+    );
+  }
+
+  const categories = profile.columns.filter((c) => c.type === "category");
+  if (categories.length > 0) {
+    lines.push("");
+    lines.push("CATEGORY COLUMNS:");
+    for (const c of categories.slice(0, 15)) {
+      lines.push(
+        `- ${c.name}: ${c.distinct ?? "?"} distinct values in the first 500 rows`,
+      );
+    }
+  }
+
+  lines.push("");
+  lines.push(
+    "CORRELATIONS (Pearson r, |r| >= 0.35; association only, not cause):",
+  );
+  if (profile.correlations.length === 0)
+    lines.push("- none strong enough to report");
+  for (const p of profile.correlations) {
+    lines.push(
+      `- ${p.a} and ${p.b}: r = ${num(p.r)} (${p.r > 0 ? "move together" : "move in opposite directions"})`,
+    );
+  }
+
+  lines.push("");
+  lines.push("SAFETY THRESHOLDS: none provided for any parameter.");
+  return lines.join("\n");
+}
+
+export function buildUserPrompt(
+  profile: DatasetProfile,
+  planned: PlannedFinding[],
+): string {
+  return [
+    "FACTS:",
+    buildFactsSheet(profile),
+    "",
+    `FINDINGS ALREADY WRITTEN (give one note for each, using these parameter names): ${planned.map((f) => f.parameter).join(", ")}`,
+    "",
+    "Return JSON with:",
+    "- headline: one sentence, at most 12 words.",
+    "- summary: 2 to 4 sentences on the period and the main movements, directions copied from FACTS.",
+    "- notes: for each finding parameter, one short sentence with a possible explanation or what to check, without numbers. Start with May, Possibly or Could.",
+    "- recommendations: 2 to 5 short, concrete checks for the next shift.",
+  ].join("\n");
+}
+
+/** JSON schema handed to Ollama's structured-output mode. */
+export const insightsJsonSchema = {
+  type: "object",
+  properties: {
+    headline: { type: "string" },
+    summary: { type: "string" },
+    notes: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: { parameter: { type: "string" }, note: { type: "string" } },
+        required: ["parameter", "note"],
+      },
+    },
+    recommendations: { type: "array", items: { type: "string" } },
+  },
+  required: ["headline", "summary", "notes", "recommendations"],
+} as const;
+
+// Lenient on purpose: small models wobble on casing and extra fields.
+const rawModelSchema = z.object({
+  headline: z.string(),
+  summary: z.string(),
+  notes: z
+    .array(z.object({ parameter: z.string(), note: z.string() }))
+    .default([]),
+  recommendations: z
+    .array(z.union([z.string(), z.object({}).passthrough()]))
+    .default([]),
+});
+
+/* ============================ Consistency checks ============================ */
+
+const key = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "");
+const UP =
+  /\b(increas\w*|rose|rise[sn]?|rising|higher|grew|grow\w*|climb\w*|upward|gain\w*|surg\w*)\b/i;
+const DOWN =
+  /\b(decreas\w*|fell|fall\w*|drop\w*|lower|declin\w*|reduc\w*|downward|shrank|dip\w*)\b/i;
+// Descriptive forms only, so imperatives such as "reduce energy use" in a
+// recommendation are not mistaken for a claim about the trend.
+const UP_DESC =
+  /\b(increased|increasing|rose|risen|rising|grew|growing|climbed|climbing|(increase|rise|growth|climb|surge|gain)s?\s+in)\b/i;
+const DOWN_DESC =
+  /\b(decreased|decreasing|fell|fallen|falling|dropped|dropping|declined|declining|(decrease|drop|decline|fall|reduction)s?\s+in)\b/i;
+
+function mentionTokens(name: string): string[] {
+  const words = name
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((w) => w.length >= 4);
+  const units = new Set(["pct", "percent", "kwh", "ppm", "m3s"]);
+  return [
+    name.toLowerCase(),
+    name.toLowerCase().replace(/[_-]+/g, " "),
+    ...words.filter((w) => !units.has(w)),
+  ];
+}
+
+/**
+ * Find clauses that name exactly one parameter and describe it moving in
+ * the opposite direction to the computed trend. Returns the offending
+ * parameter names (empty when the text is consistent).
+ */
+export function findDirectionContradictions(
+  text: string,
+  profile: DatasetProfile,
+  mode: "descriptive" | "strict" = "strict",
+): string[] {
+  const upRe = mode === "strict" ? UP : UP_DESC;
+  const downRe = mode === "strict" ? DOWN : DOWN_DESC;
+  const numeric = profile.columns.filter((c) => c.type === "number");
+  const clauses = text
+    .toLowerCase()
+    .split(/[.;:!?]|,|\bwhile\b|\bwhereas\b|\bbut\b|\band\b/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const bad = new Set<string>();
+  for (const clause of clauses) {
+    const mentioned = numeric.filter((c) =>
+      mentionTokens(c.name).some((t) => clause.includes(t)),
+    );
+    if (mentioned.length !== 1) continue;
+    const c = mentioned[0]!;
+    const dir = direction(c.trendPct);
+    const up = upRe.test(clause);
+    const down = downRe.test(clause);
+    if (up === down) continue;
+    if ((dir === "fell" && up) || (dir === "rose" && down)) bad.add(c.name);
+  }
+  // "X remained stable" when X moved noticeably.
+  if (mode === "strict") {
+    for (const clause of clauses) {
+      if (!STABLE.test(clause) || UP.test(clause) || DOWN.test(clause))
+        continue;
+      const mentioned = numeric.filter((c) =>
+        mentionTokens(c.name).some((t) => clause.includes(t)),
+      );
+      if (mentioned.length !== 1) continue;
+      const c = mentioned[0]!;
+      if (Math.abs(c.trendPct ?? 0) >= STABLE_CONTRADICTION_PCT)
+        bad.add(c.name);
+    }
+  }
+  return [...bad];
+}
+
+const STABLE =
+  /\b(stable|steady|unchanged|flat|constant|no (significant )?change)\b/i;
+/** A parameter that moved at least this much should not be called stable. */
+export const STABLE_CONTRADICTION_PCT = 5;
+
+const NUMBER_TOKEN = /\d+(?:[.,]\d+)*(?:\.\d+)?/g;
+
+function numbersIn(text: string): number[] {
+  return (text.match(NUMBER_TOKEN) ?? [])
+    .map((t) => Number(t.replace(/,(?=\d{3}\b)/g, "")))
+    .filter((n) => Number.isFinite(n));
+}
+
+/** Every number that appears in the facts sheet, plus small counts. */
+export function allowedNumbers(profile: DatasetProfile): number[] {
+  return numbersIn(`${buildFactsSheet(profile)} ${describeAll(profile)}`);
+}
+
+function describeAll(profile: DatasetProfile): string {
+  return profile.columns
+    .filter((c) => c.type === "number")
+    .map((c) => describeColumn(c, profile))
+    .join(" ");
+}
+
+/**
+ * Numbers in model text that do not appear in the facts (allowing the model
+ * to round a fact to fewer decimals). Small integers (counts) are allowed.
+ */
+export function findUngroundedNumbers(
+  text: string,
+  allowed: number[],
+): number[] {
+  const bad: number[] = [];
+  for (const x of numbersIn(text)) {
+    if (Number.isInteger(x) && x <= 12) continue;
+    const ok = allowed.some((y) => {
+      const ay = Math.abs(y);
+      if (x === ay) return true;
+      for (let d = 0; d <= 3; d++) if (Number(ay.toFixed(d)) === x) return true;
+      return false;
+    });
+    if (!ok) bad.push(x);
+  }
+  return bad;
+}
+
+function clip(s: string, max: number): string {
+  const t = s.replace(/\s+/g, " ").trim();
+  return t.length > max ? `${t.slice(0, max - 1).trimEnd()}…` : t;
+}
+
+export interface NormaliseOutcome {
+  insights: DatasetInsights;
+  /** Model sentences dropped for contradicting the data or naming unknown parameters. */
+  droppedItems: number;
+  /** Headline/summary contradicted the data or quoted a number not in the facts. */
+  summaryContradicted: boolean;
+}
+
+/**
+ * Merge the model's JSON with the code-written findings and drop anything
+ * that contradicts the computed directions. Returns null if the JSON is unusable.
+ */
+export function normaliseInsights(
+  value: unknown,
+  profile: DatasetProfile,
+  planned: PlannedFinding[],
+): NormaliseOutcome | null {
+  const parsed = rawModelSchema.safeParse(value);
+  if (!parsed.success) return null;
+  const raw = parsed.data;
+  let dropped = 0;
+  const allowed = allowedNumbers(profile);
+  const grounded = (text: string) =>
+    findUngroundedNumbers(text, allowed).length === 0;
+
+  const notes = new Map<string, string>();
+  for (const n of raw.notes) {
+    const target = planned.find((f) => key(f.parameter) === key(n.parameter));
+    // Small models sometimes emit "May: ..." literally.
+    const note = clip(n.note.replace(/^(may|possibly|could)\s*:\s*/i, ""), 300);
+    if (!target || !note || notes.has(target.parameter)) {
+      dropped++;
+      continue;
+    }
+    if (
+      findDirectionContradictions(note, profile, "descriptive").length > 0 ||
+      !grounded(note)
+    ) {
+      dropped++;
+      continue;
+    }
+    notes.set(target.parameter, note);
+  }
+
+  const findings: DatasetInsights["findings"] = planned.map((f) => {
+    const interpretation = notes.get(f.parameter);
+    return { ...f, ...(interpretation ? { interpretation } : {}) };
+  });
+
+  const recommendations = raw.recommendations
+    .map((r) =>
+      typeof r === "string"
+        ? r
+        : Object.values(r)
+            .filter((v) => typeof v === "string")
+            .join(" "),
+    )
+    .map((r) => clip(r, 300))
+    .filter((r) => {
+      if (!r) return false;
+      if (
+        findDirectionContradictions(r, profile, "descriptive").length > 0 ||
+        !grounded(r)
+      ) {
+        dropped++;
+        return false;
+      }
+      return true;
+    })
+    .slice(0, 5);
+
+  const headline = clip(raw.headline, 120);
+  const summary = clip(raw.summary, 1200);
+  if (!headline || !summary) return null;
+  const summaryText = `${headline}. ${summary}`;
+  const summaryContradicted =
+    findDirectionContradictions(summaryText, profile).length > 0 ||
+    !grounded(summaryText);
+
+  return {
+    insights: { headline, summary, findings, recommendations },
+    droppedItems: dropped,
+    summaryContradicted,
+  };
+}
