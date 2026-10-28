@@ -3,7 +3,7 @@ import { ConfigError } from "./config-error";
 import {
   buildUserPrompt,
   fallbackSummary,
-  findSafetyClaimConflict,
+  findSafetyWordingConflict,
   insightsJsonSchema,
   normaliseInsights,
   planFindings,
@@ -171,7 +171,7 @@ export async function runAnalysis(
       !best.safetyConflict?.startsWith("the model reported")
     ) {
       const conflict = safety.explanation
-        ? findSafetyClaimConflict(safety.explanation, safety.status)
+        ? findSafetyWordingConflict(safety.explanation, safety.status, profile)
         : null;
       insights = {
         ...insights,

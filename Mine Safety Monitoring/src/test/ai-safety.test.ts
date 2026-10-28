@@ -1,9 +1,11 @@
 // @vitest-environment node
+// All readings are SYNTHETIC; the site CO rule comes from a test fixture, not a real limit.
 import { describe, expect, it } from "vitest";
 
 import { runAnalysis } from "@/lib/ai/analyst";
 import {
   buildFactsSheet,
+  findBreachMisattribution,
   findSafetyClaimConflict,
   normaliseInsights,
   planFindings,
@@ -13,39 +15,18 @@ import type {
   LocalInferenceProvider,
   StructuredRequest,
 } from "@/lib/ai/provider";
-import { buildDataset, buildProfile } from "@/lib/dataset";
+import { buildProfile } from "@/lib/dataset";
 import { assessSafety } from "@/lib/safety/assess";
-import { safetyRuleSchema } from "@/lib/safety/rules";
+import { builtinConfig, type RulesConfig } from "@/lib/safety/config";
+import { NOW, sensorData, siteFile, withSite } from "./fixtures";
 
-// Test-only threshold fixture (not a real safety limit).
-const gasRule = safetyRuleSchema.parse({
-  id: "gas",
-  label: "Test gas",
-  columns: ["gas_pct"],
-  unit: "%",
-  direction: "above",
-  warning: 1,
-  critical: 2,
-  source: "test fixture clause 1",
-  required: true,
-});
-const NOW = Date.parse("2026-10-01T09:00:00");
-const ds = (lastGas: number) =>
-  buildDataset(
-    [
-      "time,gas_pct,flow_m3s",
-      ...Array.from(
-        { length: 6 },
-        (_, i) => `2026-10-01 08:${i}0,0.5,${40 + i}`,
-      ),
-      `2026-10-01 09:00,${lastGas},46`,
-    ].join("\n"),
-    "gas.csv",
-  );
+const verifiedCo = withSite(siteFile());
+const ds = (lastCh4: number) =>
+  sensorData({ edit: (i) => (i === 9 ? { CH4_vol_pct: lastCh4 } : {}) });
 
-function profileFor(lastGas: number, rules = [gasRule]) {
-  const d = ds(lastGas);
-  return buildProfile(d, assessSafety(d, rules, { now: NOW }));
+function profileFor(lastCh4: number, config: RulesConfig = verifiedCo) {
+  const d = ds(lastCh4);
+  return buildProfile(d, assessSafety(d, config, { now: NOW }));
 }
 
 function fake(
@@ -67,14 +48,13 @@ function fake(
 }
 
 const answer = (over: Record<string, unknown> = {}) => ({
-  headline: "Gas reading reached the critical limit",
-  summary:
-    "gas_pct reached the critical limit in the last hour while flow_m3s rose.",
+  headline: "Methane reading reached the critical limit",
+  summary: "CH4_vol_pct reached the critical limit in the last hour.",
   notes: [],
-  recommendations: ["Verify the gas sensor reading."],
+  recommendations: ["Verify the methane sensor reading."],
   safety_status: "UNSAFE",
   safety_explanation:
-    "gas_pct at 2026-10-01 09:00 breaches the configured critical limit.",
+    "CH4_vol_pct at 2026-10-28T08:59:00Z breaches Reg. 153(2)(c).",
   ...over,
 });
 
@@ -87,33 +67,65 @@ describe("mining system prompt", () => {
     expect(MINING_SYSTEM_PROMPT).toMatch(
       /Never claim the mine is certified safe/,
     );
+    expect(MINING_SYSTEM_PROMPT).toMatch(
+      /The only statuses are SAFE, CAUTION and UNSAFE/,
+    );
+    expect(MINING_SYSTEM_PROMPT).not.toMatch(/INSUFFICIENT/);
   });
 
-  it("includes this file's sensor names, units and configured thresholds", () => {
-    const sys = buildSystemPrompt(profileFor(2.5));
-    expect(sys).toContain("- gas_pct (%)");
-    expect(sys).toContain("- flow_m3s (m³/s)");
+  it("includes sensor names, units, thresholds, verification status and clauses", () => {
+    const sys = buildSystemPrompt(profileFor(1.5));
+    expect(sys).toContain("- CH4_vol_pct (%vol)");
+    expect(sys).toContain("- CO_ppm (ppm)");
     expect(sys).toMatch(
-      /gas_pct: warning ≥ 1 %, critical ≥ 2 % \(source: test fixture clause 1\)/,
+      /CH4_vol_pct: warning > 0\.8 %vol, critical > 1\.25 %vol \[VERIFIED REGULATORY; Reg\. 153\(2\)\(c\)/,
     );
+    expect(sys).toMatch(/O2_vol_pct: critical < 19 %vol \[VERIFIED REGULATORY/);
+    expect(sys).toMatch(/CO_ppm: .*\[VERIFIED SITE; TEST clause 1\]/);
   });
 
-  it("says when no thresholds are configured", () => {
-    expect(buildSystemPrompt(profileFor(0.5, []))).toMatch(
-      /none\. No verified thresholds apply/,
-    );
+  it("says when no threshold could be checked", () => {
+    const d = { ...sensorData({ n: 1 }), rows: [], rowCount: 0 };
+    expect(
+      buildSystemPrompt(
+        buildProfile(d, assessSafety(d, verifiedCo, { now: NOW })),
+      ),
+    ).toMatch(/none\. No configured threshold could be checked/);
   });
 
-  it("puts the safety assessment and 1-hour averages in the facts", () => {
-    const facts = buildFactsSheet(profileFor(2.5));
+  it("puts status, timestamp, triggered rules, sources and 1-hour averages in the facts", () => {
+    const facts = buildFactsSheet(profileFor(1.5));
     expect(facts).toContain("STATUS: UNSAFE");
-    expect(facts).toMatch(/1-hour moving average 0\.833 % over 6 reading\(s\)/);
-    expect(facts).toMatch(/gas_pct: CRITICAL; latest 2\.5 %/);
+    expect(facts).toMatch(/Newest reading: .*2026-10-28/);
+    expect(facts).toMatch(
+      /cmr153-ch4-any-place \(VERIFIED REGULATORY\): CH4_vol_pct CRITICAL; worst 1\.5 %vol/,
+    );
+    expect(facts).toMatch(/source Reg\. 153\(2\)\(c\)/);
+    expect(facts).toMatch(
+      /O2_vol_pct: latest 20\.8 %vol .*1-hour average 20\.8 %vol/,
+    );
+  });
+
+  it("lists required checks that are not verified when no site CO limit exists", () => {
+    const facts = buildFactsSheet(profileFor(0.2, builtinConfig()));
+    expect(facts).toContain("STATUS: CAUTION");
+    expect(facts).toMatch(
+      /Required checks not configured or not verified: .*co-site-limit/,
+    );
+  });
+
+  it("includes data-quality warnings", () => {
+    const d = sensorData({ endMinutesBeforeNow: 120 });
+    const facts = buildFactsSheet(
+      buildProfile(d, assessSafety(d, verifiedCo, { now: NOW })),
+    );
+    expect(facts).toMatch(/STALE/);
+    expect(facts).toMatch(/Data-quality warnings:\n {2}- .*old/);
   });
 
   it("is sent to the model on every analysis", async () => {
     const p = fake([answer()]);
-    await runAnalysis(profileFor(2.5), { provider: p });
+    await runAnalysis(profileFor(1.5), { provider: p });
     expect(p.calls[0]!.system).toContain(
       "Mining Safety and Environmental Analytics Assistant",
     );
@@ -125,7 +137,7 @@ describe("mining system prompt", () => {
 
 describe("the model cannot override the safety status", () => {
   it("attaches the rule-based status to every successful analysis", async () => {
-    const res = await runAnalysis(profileFor(2.5), {
+    const res = await runAnalysis(profileFor(1.5), {
       provider: fake([answer()]),
     });
     expect(res.ok && res.insights.safety).toMatchObject({
@@ -139,7 +151,7 @@ describe("the model cannot override the safety status", () => {
       safety_status: "SAFE",
       safety_explanation: "Conditions are safe.",
     });
-    const res = await runAnalysis(profileFor(2.5), {
+    const res = await runAnalysis(profileFor(1.5), {
       provider: fake([lie, lie]),
     });
     expect(res.ok).toBe(true);
@@ -150,32 +162,32 @@ describe("the model cannot override the safety status", () => {
   });
 
   it("retries once and keeps the consistent answer", async () => {
-    const lie = answer({ safety_status: "SAFE" });
-    const p = fake([lie, answer()]);
-    const res = await runAnalysis(profileFor(2.5), { provider: p });
+    const p = fake([answer({ safety_status: "SAFE" }), answer()]);
+    const res = await runAnalysis(profileFor(1.5), { provider: p });
     expect(p.calls).toHaveLength(2);
     expect(res.ok && res.insights.safety!.needsReview).toBe(false);
   });
 
-  it("flags 'safe' wording when data is insufficient", () => {
-    const profile = profileFor(0.5, []);
+  it("flags 'safe' wording when the status is CAUTION", () => {
+    const profile = profileFor(0.2, builtinConfig());
     const out = normaliseInsights(
       answer({
-        safety_status: "INSUFFICIENT_DATA",
+        safety_status: "CAUTION",
         summary: "Conditions in the mine are safe this shift.",
-        safety_explanation: "No thresholds are configured.",
+        safety_explanation: "No verified CO threshold is configured.",
       }),
       profile,
       planFindings(profile),
     )!;
     expect(out.insights.safety).toMatchObject({
-      status: "INSUFFICIENT_DATA",
+      status: "CAUTION",
       needsReview: true,
     });
   });
 
   it("drops recommendations that claim a breach the rules did not find", () => {
-    const profile = profileFor(0.5);
+    const profile = profileFor(0.2);
+    expect(profile.safety!.status).toBe("SAFE");
     const out = normaliseInsights(
       answer({
         safety_status: "SAFE",
@@ -183,15 +195,15 @@ describe("the model cannot override the safety status", () => {
         safety_explanation:
           "All configured checks passed; this is not a certification.",
         recommendations: [
-          "Evacuate: gas exceeds the limit.",
-          "Recalibrate the gas sensor.",
+          "Evacuate: methane exceeds the limit.",
+          "Recalibrate the methane sensor.",
         ],
       }),
       profile,
       planFindings(profile),
     )!;
     expect(out.insights.recommendations).toEqual([
-      "Recalibrate the gas sensor.",
+      "Recalibrate the methane sensor.",
     ]);
   });
 
@@ -202,7 +214,7 @@ describe("the model cannot override the safety status", () => {
     expect(
       findSafetyClaimConflict(
         "Conditions cannot be confirmed as safe.",
-        "INSUFFICIENT_DATA",
+        "CAUTION",
       ),
     ).toBeNull();
     expect(
@@ -238,11 +250,11 @@ describe("the model cannot override the safety status", () => {
 
 describe("malformed model output", () => {
   it("does not crash on missing safety fields and keeps the rule-based status", async () => {
-    const res = await runAnalysis(profileFor(2.5), {
+    const res = await runAnalysis(profileFor(1.5), {
       provider: fake([
         {
-          headline: "Gas check",
-          summary: "gas_pct rose.",
+          headline: "Methane check",
+          summary: "CH4_vol_pct rose.",
           notes: [],
           recommendations: [],
         },
@@ -252,14 +264,14 @@ describe("malformed model output", () => {
   });
 
   it("returns a structured error, not a crash, for unusable JSON", async () => {
-    const res = await runAnalysis(profileFor(2.5), {
+    const res = await runAnalysis(profileFor(1.5), {
       provider: fake(["not json", 42]),
     });
     expect(!res.ok && res.error.code).toBe("bad_response");
   });
 
   it("treats odd safety_status values as a review flag", async () => {
-    const res = await runAnalysis(profileFor(2.5), {
+    const res = await runAnalysis(profileFor(1.5), {
       provider: fake([
         answer({ safety_status: { nope: 1 } }),
         answer({ safety_status: 7 }),
@@ -268,16 +280,95 @@ describe("malformed model output", () => {
     expect(res.ok && res.insights.safety!.status).toBe("UNSAFE");
   });
 
-  it("defaults to INSUFFICIENT_DATA when no assessment was supplied", async () => {
-    const d = ds(0.5);
-    const res = await runAnalysis(buildProfile(d), {
+  it("defaults to CAUTION when no assessment was supplied", async () => {
+    const res = await runAnalysis(buildProfile(ds(0.2)), {
       provider: fake([
         answer({
-          safety_status: "INSUFFICIENT_DATA",
+          safety_status: "SAFE",
           safety_explanation: "No assessment was supplied.",
         }),
       ]),
     });
-    expect(res.ok && res.insights.safety!.status).toBe("INSUFFICIENT_DATA");
+    expect(res.ok && res.insights.safety!.status).toBe("CAUTION");
+  });
+
+  it("does not accept the removed INSUFFICIENT_DATA status from the model", async () => {
+    const odd = answer({
+      safety_status: "INSUFFICIENT_DATA",
+      safety_explanation: "Unknown.",
+    });
+    const res = await runAnalysis(profileFor(0.2, builtinConfig()), {
+      provider: fake([odd, odd]),
+    });
+    expect(res.ok && res.insights.safety!.status).toBe("CAUTION");
+    expect(res.ok && res.insights.safety!.needsReview).toBe(true);
+  });
+});
+
+describe("misattributed breaches", () => {
+  // Only methane breaches here; O2, CO2 and the site CO rule were checked and passed.
+  const profile = profileFor(1.5);
+  it("flags a parameter said to breach a limit that the rules found within limits", () => {
+    expect(
+      findBreachMisattribution(
+        "The CO2 level exceeded critical limits and exceeded the electric supply cutoff threshold.",
+        profile,
+      ),
+    ).toMatch(/CO2_vol_pct breached a limit/);
+    expect(
+      findBreachMisattribution(
+        "Methane and carbon dioxide exceeded critical limits.",
+        profile,
+      ),
+    ).toMatch(/CO2_vol_pct/);
+    expect(
+      findBreachMisattribution(
+        "O2 vol pct is above the critical level.",
+        profile,
+      ),
+    ).toMatch(/O2_vol_pct/);
+  });
+
+  it("accepts correct, negated, hedged and unrelated wording", () => {
+    expect(
+      findBreachMisattribution(
+        "CH4_vol_pct exceeded the critical limit of 1.25 %vol.",
+        profile,
+      ),
+    ).toBeNull();
+    expect(
+      findBreachMisattribution(
+        "Methane breached Reg. 153(2)(c) while CO2 rose slightly.",
+        profile,
+      ),
+    ).toBeNull();
+    expect(
+      findBreachMisattribution("CO2 did not exceed its limit.", profile),
+    ).toBeNull();
+    expect(
+      findBreachMisattribution(
+        "CO2 could exceed the limit if the trend continues.",
+        profile,
+      ),
+    ).toBeNull();
+    // "co" must not match inside "co2" or "cooling"; CO_ppm passed but is not named here.
+    expect(
+      findBreachMisattribution(
+        "Cooling fans exceeded the expected duty limit.",
+        profile,
+      ),
+    ).toBeNull();
+  });
+
+  it("marks such AI text for review and keeps the rule-based status", async () => {
+    const wrong = answer({
+      safety_explanation: "Methane and CO2 exceeded critical limits.",
+    });
+    const res = await runAnalysis(profile, { provider: fake([wrong, wrong]) });
+    expect(res.ok && res.insights.safety).toMatchObject({
+      status: "UNSAFE",
+      needsReview: true,
+    });
+    expect(res.ok && res.insights.safety!.reviewReason).toMatch(/CO2_vol_pct/);
   });
 });

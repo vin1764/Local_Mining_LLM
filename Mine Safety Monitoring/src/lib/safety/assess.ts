@@ -2,59 +2,102 @@
  * Deterministic safety classification. The language model never decides the
  * status; it only explains the result of this function.
  *
- * Priority order (first match wins):
- *   1. UNSAFE             a configured critical threshold is breached by a
- *                         valid reading in the current window.
- *   2. INSUFFICIENT_DATA  no applicable verified thresholds, a required
- *                         parameter is missing, readings are stale, invalid,
- *                         conflicting, or the data is not current.
- *   3. CAUTION            a warning threshold is breached, a critical breach
- *                         happened earlier in the file, an abnormal reading
- *                         (|z| ≥ 3) needs verification, or sensors disagree.
- *   4. SAFE               every applicable configured check passed on
- *                         adequate, current data. Even then this is not a
- *                         certification that the mine is safe.
+ * Only three statuses exist. Decision order (first match wins):
+ *   1. UNSAFE   a VERIFIED (regulatory or site) critical rule is triggered by a
+ *               valid reading in the evaluation window.
+ *   2. CAUTION  data quality is inadequate (stale, missing, invalid,
+ *               conflicting), a required rule is not configured/verified, a
+ *               verified warning rule or any provisional rule is triggered,
+ *               or nothing verified could be checked.
+ *   3. SAFE     the required measurements are current and valid, every required
+ *               rule is configured, verified and checked, and every check passed.
+ *               Even then this is not a certification that the mine is safe.
  *
- * "Current window" = readings in (last timestamp − 60 min, last timestamp].
+ * The evaluation window is (newest timestamp − evaluationWindowMinutes, newest].
  */
-import {
-  ASSESSMENT_SETTINGS,
-  type AssessmentSettings,
-} from "@/config/safety-rules";
 import type { Dataset } from "@/lib/dataset";
-import { movingAverage, parseTimestamp } from "@/lib/moving-average";
-import type { SafetyRule } from "./rules";
+import {
+  medianSamplingIntervalMs,
+  movingAverage,
+  parseTimestamp,
+} from "@/lib/moving-average";
+import {
+  VERIFICATION_LABEL,
+  type Operator,
+  type ParameterDef,
+  type RulesConfig,
+  type SafetyRule,
+  type VerificationStatus,
+} from "./config";
+import { MIN_OXYGEN_DEFICIENCY, deriveRatios } from "./derived";
+import { convert } from "./units";
 
-export type SafetyStatus = "SAFE" | "CAUTION" | "UNSAFE" | "INSUFFICIENT_DATA";
-export type RuleLevel =
-  "ok" | "warning" | "critical" | "no_data" | "stale" | "invalid";
-
+export type SafetyStatus = "SAFE" | "CAUTION" | "UNSAFE";
+export const SAFETY_STATUSES: readonly SafetyStatus[] = [
+  "SAFE",
+  "CAUTION",
+  "UNSAFE",
+];
 export const SAFETY_STATUS_LABEL: Record<SafetyStatus, string> = {
   SAFE: "SAFE",
   CAUTION: "CAUTION",
   UNSAFE: "UNSAFE",
-  INSUFFICIENT_DATA: "INSUFFICIENT DATA",
 };
+
+export type RuleResult = "ok" | "warning" | "critical" | "not_evaluated";
 
 export interface RuleEvaluation {
   ruleId: string;
-  label: string;
-  column: string;
+  parameter: string;
+  /** The data field's unit; thresholds below are converted into it. */
   unit: string;
-  direction: "above" | "below";
+  ruleUnit: string;
+  operator: Operator;
   warning: number | null;
-  critical: number;
-  source: string;
-  level: RuleLevel;
-  /** Latest valid reading of this column and its timestamp label. */
-  latestValue: number | null;
+  critical: number | null;
+  severity: "critical" | "warning" | "monitoring";
+  verificationStatus: VerificationStatus;
+  enabled: boolean;
+  requiredForSafe: boolean;
+  sourceDocument: string;
+  sourceClause: string;
+  sourceUrl: string | null;
+  officialCopyChecked: boolean | null;
+  contextNote: string | null;
+  result: RuleResult;
+  notEvaluatedReason: string | null;
+  /** What this rule contributes to the status. */
+  effect: "UNSAFE" | "CAUTION" | "none";
+  latestValue: number | boolean | null;
   latestAt: string | null;
-  /** Most extreme valid reading in the current window (highest for "above"). */
-  worstValue: number | null;
+  worstValue: number | boolean | null;
   worstAt: string | null;
-  /** 1-hour moving average at the latest valid reading. */
   movingAvg1h: number | null;
   explanation: string;
+}
+
+export type DataQualityCode =
+  | "empty"
+  | "no_time_column"
+  | "bad_timestamps"
+  | "stale_data"
+  | "future_timestamps"
+  | "sampling_interval"
+  | "missing_parameter"
+  | "missing_latest"
+  | "stale_parameter"
+  | "invalid_values"
+  | "conflict"
+  | "derived_mismatch"
+  | "missing_values"
+  | "column_name_case";
+
+export interface DataQualityWarning {
+  code: DataQualityCode;
+  message: string;
+  parameter?: string;
+  /** True when this warning prevents a SAFE classification. */
+  blocksSafe: boolean;
 }
 
 export interface SafetyAssessment {
@@ -62,24 +105,83 @@ export interface SafetyAssessment {
   /** Why the status was chosen, most important first. */
   reasons: string[];
   evaluations: RuleEvaluation[];
-  dataQualityNotes: string[];
+  dataQuality: DataQualityWarning[];
   /** Rule-based next steps (available without any AI model). */
   nextActions: string[];
-  /** Numeric columns no configured rule covers (not assessed). */
+  triggeredRuleIds: string[];
+  /** Newest valid timestamp, as written in the file, and as ISO. */
+  latestTimestamp: string | null;
+  latestTimestampIso: string | null;
+  dataAgeMinutes: number | null;
+  isStale: boolean;
+  samplingIntervalSeconds: number | null;
+  rulesSummary: {
+    total: number;
+    enabled: number;
+    evaluated: number;
+    verifiedRegulatory: number;
+    verifiedSite: number;
+    provisional: number;
+    requiresVerification: number;
+  };
+  /** Required rules that are not configured, verified or checkable. */
+  unverifiedRequired: string[];
+  /** Data fields that no rule checked. */
   unassessedParameters: string[];
-  /** Timestamp label of the newest reading the assessment describes. */
-  dataAsOf: string | null;
-  rulesSource: string;
-  ruleCount: number;
+  configName: string;
+  /** Some verified rules were checked against an unofficial copy of the source. */
+  officialCopyCaveat: boolean;
 }
 
-const breach = (v: number, limit: number, dir: "above" | "below") =>
-  dir === "above" ? v >= limit : v <= limit;
-const worse = (a: number, b: number, dir: "above" | "below") =>
-  dir === "above" ? a > b : a < b;
-const fmt = (v: number | null, unit: string) =>
-  v === null ? "n/a" : `${Number(v.toFixed(4))}${unit ? ` ${unit}` : ""}`;
-const minutes = (ms: number) => {
+const isVerified = (s: VerificationStatus) =>
+  s === "verified_regulatory" || s === "verified_site";
+const isAbove = (op: Operator) =>
+  op === "greater_than" || op === "greater_than_or_equal";
+
+export function breaches(v: number, limit: number, op: Operator): boolean {
+  switch (op) {
+    case "greater_than":
+      return v > limit;
+    case "greater_than_or_equal":
+      return v >= limit;
+    case "less_than":
+      return v < limit;
+    case "less_than_or_equal":
+      return v <= limit;
+    default:
+      return false;
+  }
+}
+
+const OP_TEXT: Record<Operator, string> = {
+  greater_than: ">",
+  greater_than_or_equal: "≥",
+  less_than: "<",
+  less_than_or_equal: "≤",
+  is_true: "= detected",
+  steady_increase: "steady increase",
+};
+export const operatorText = (op: Operator) => OP_TEXT[op];
+
+/** Parse a yes/no detection. Returns null for anything that is not clearly yes or no. */
+export function parseDetection(v: unknown): boolean | null {
+  if (v === true || v === 1) return true;
+  if (v === false || v === 0) return false;
+  if (typeof v !== "string") return null;
+  const s = v.trim().toLowerCase();
+  if (["1", "true", "yes", "y", "detected", "positive"].includes(s))
+    return true;
+  if (["0", "false", "no", "n", "not detected", "negative", "none"].includes(s))
+    return false;
+  return null;
+}
+
+const fmt = (v: number | boolean | null, unit: string) => {
+  if (v === null) return "n/a";
+  if (typeof v === "boolean") return v ? "DETECTED" : "not detected";
+  return `${Number(v.toPrecision(6))}${unit && unit !== "ratio" && unit !== "index" ? ` ${unit}` : ""}`;
+};
+const ago = (ms: number) => {
   const m = Math.round(ms / 60_000);
   if (m < 120) return `${m} min`;
   const h = Math.round(m / 60);
@@ -88,355 +190,633 @@ const minutes = (ms: number) => {
 
 export function assessSafety(
   dataset: Dataset,
-  rules: readonly SafetyRule[],
-  options: {
-    settings?: AssessmentSettings;
-    now?: number;
-    rulesSource?: string;
-  } = {},
+  config: RulesConfig,
+  options: { now?: number } = {},
 ): SafetyAssessment {
-  const settings = options.settings ?? ASSESSMENT_SETTINGS;
   const now = options.now ?? Date.now();
+  const dq = config.dataQuality;
+  const quality: DataQualityWarning[] = [];
+  const addDq = (w: DataQualityWarning) => {
+    if (!quality.some((q) => q.message === w.message)) quality.push(w);
+  };
   const tc = dataset.timeColumn;
-  const critical: string[] = [];
-  const insufficient: string[] = [];
-  const caution: string[] = [];
-  const notes: string[] = [];
-  const evaluations: RuleEvaluation[] = [];
+  const rows = dataset.rows;
 
-  // Timestamps, in row order (rows are already sorted by time).
-  const times = dataset.rows.map((r) => (tc ? parseTimestamp(r[tc]) : null));
-  const validTimes = times.filter((t): t is number => t !== null);
-  const lastT = validTimes.length ? Math.max(...validTimes) : null;
-  const lastIdx =
-    lastT === null ? dataset.rows.length - 1 : times.lastIndexOf(lastT);
+  // ---- Timestamps -------------------------------------------------------
+  const times = rows.map((r) => (tc ? parseTimestamp(r[tc]) : null));
+  const valid = times
+    .map((t, i) => ({ t, i }))
+    .filter((x): x is { t: number; i: number } => x.t !== null);
+  valid.sort((a, b) => a.t - b.t || a.i - b.i);
+  const latestT = valid.length ? valid[valid.length - 1]!.t : null;
+  const latestIdx = valid.length ? valid[valid.length - 1]!.i : -1;
   const label = (i: number) =>
-    tc ? String(dataset.rows[i]?.[tc] ?? `row ${i + 1}`) : `row ${i + 1}`;
-  const dataAsOf = dataset.rows.length ? label(Math.max(0, lastIdx)) : null;
+    tc ? String(rows[i]?.[tc] ?? `row ${i + 1}`) : `row ${i + 1}`;
+  const latestTimestamp = latestIdx >= 0 ? label(latestIdx) : null;
 
-  if (dataset.rows.length === 0)
-    insufficient.push("The file has no data rows.");
-  if (!tc) {
-    insufficient.push(
-      "The file has no time column, so it cannot be confirmed that readings are current.",
-    );
-  } else if (lastT === null) {
-    insufficient.push(`No valid timestamps were found in "${tc}".`);
-  } else {
-    const unparsed = times.length - validTimes.length;
-    if (unparsed > 0)
-      notes.push(
-        `${unparsed} row(s) have an unreadable timestamp and were ignored.`,
-      );
-    const age = now - lastT;
-    if (age > settings.maxDataAgeMinutes * 60_000) {
-      insufficient.push(
-        `The newest reading (${dataAsOf}) is ${minutes(age)} old, so it does not describe current conditions.`,
-      );
-    } else if (age < -5 * 60_000) {
-      notes.push(
-        `The newest timestamp (${dataAsOf}) is in the future; check the logger clock.`,
-      );
+  if (rows.length === 0)
+    addDq({
+      code: "empty",
+      message: "The file has no data rows.",
+      blocksSafe: true,
+    });
+  else if (!tc)
+    addDq({
+      code: "no_time_column",
+      message:
+        "No timestamp column was found, so it cannot be confirmed that readings are current.",
+      blocksSafe: true,
+    });
+  else if (latestT === null)
+    addDq({
+      code: "bad_timestamps",
+      message: `No valid timestamps in "${tc}".`,
+      blocksSafe: true,
+    });
+  else if (valid.length < rows.length)
+    addDq({
+      code: "bad_timestamps",
+      message: `${rows.length - valid.length} row(s) have an unreadable timestamp and were ignored.`,
+      blocksSafe: false,
+    });
+
+  const dataAgeMs = latestT === null ? null : now - latestT;
+  let isStale = latestT === null;
+  if (dataAgeMs !== null) {
+    if (dataAgeMs > dq.staleAfterMinutes * 60_000) {
+      isStale = true;
+      addDq({
+        code: "stale_data",
+        message: `Newest reading (${latestTimestamp}) is ${ago(dataAgeMs)} old; data older than ${dq.staleAfterMinutes} min is stale, so it does not describe current conditions.`,
+        blocksSafe: true,
+      });
+    } else if (dataAgeMs < -5 * 60_000) {
+      addDq({
+        code: "future_timestamps",
+        message: `Newest timestamp (${latestTimestamp}) is in the future; check the logger clock or time zone.`,
+        blocksSafe: true,
+      });
     }
   }
 
-  const windowStart =
-    lastT === null ? null : lastT - settings.currentWindowMinutes * 60_000;
+  const inferredMs = medianSamplingIntervalMs(valid.map((v) => v.t));
+  const expectedMs = dq.expectedSamplingIntervalSeconds
+    ? dq.expectedSamplingIntervalSeconds * 1000
+    : null;
+  if (expectedMs && inferredMs && inferredMs > 2 * expectedMs) {
+    addDq({
+      code: "sampling_interval",
+      message: `Readings arrive every ${Math.round(inferredMs / 1000)} s, slower than the expected ${dq.expectedSamplingIntervalSeconds} s.`,
+      blocksSafe: true,
+    });
+  }
+  const intervalMs = expectedMs ?? inferredMs;
+  const paramStaleMs = intervalMs
+    ? Math.max(dq.parameterStaleFactor * intervalMs, 60_000)
+    : dq.staleAfterMinutes * 60_000;
+
+  const windowMs = dq.evaluationWindowMinutes * 60_000;
   const inWindow = (i: number) => {
-    if (windowStart === null || lastT === null) return i === lastIdx; // no time: latest row only
+    if (latestT === null) return i === rows.length - 1; // no time: newest row only
     const t = times[i];
-    return t !== null && t !== undefined && t > windowStart && t <= lastT;
+    return (
+      t !== null && t !== undefined && t > latestT - windowMs && t <= latestT
+    );
   };
 
-  if (rules.length === 0) {
-    insufficient.unshift(
-      "No verified safety thresholds are configured, so no reading can be checked against a limit.",
-    );
-  }
-
-  const numericByKey = new Map(
-    dataset.numericNames.map((n) => [n.toLowerCase(), n]),
+  // ---- Columns ----------------------------------------------------------
+  const columnByName = new Map(dataset.columns.map((c) => [c.name, c.name]));
+  const columnByLower = new Map(
+    dataset.columns.map((c) => [c.name.toLowerCase(), c.name]),
   );
-  const covered = new Set<string>();
+  const findColumn = (name: string) =>
+    columnByName.get(name) ?? columnByLower.get(name.toLowerCase()) ?? null;
+  const paramDef = new Map<string, ParameterDef>(
+    config.parameters.map((p) => [p.name, p]),
+  );
 
-  for (const rule of rules) {
-    const cols = rule.columns
-      .map((c) => numericByKey.get(c.toLowerCase()))
-      .filter((c): c is string => !!c);
-    if (cols.length === 0) {
-      if (rule.required)
-        insufficient.push(
-          `Required parameter "${rule.label}" (${rule.columns.join(", ")}) is not in this file.`,
+  /** Valid value of a parameter in a row, or null (missing/invalid). */
+  const readValue = (
+    def: ParameterDef,
+    raw: unknown,
+  ): { value: number | boolean | null; invalid: boolean } => {
+    if (raw === null || raw === undefined || raw === "")
+      return { value: null, invalid: false };
+    if (def.type === "boolean") {
+      const b = parseDetection(raw);
+      return b === null
+        ? { value: null, invalid: true }
+        : { value: b, invalid: false };
+    }
+    const n = typeof raw === "number" ? raw : Number(String(raw).trim());
+    if (!Number.isFinite(n)) return { value: null, invalid: true };
+    if (
+      (def.min !== undefined && n < def.min) ||
+      (def.max !== undefined && n > def.max)
+    )
+      return { value: null, invalid: true };
+    return { value: n, invalid: false };
+  };
+
+  // Per-parameter scans are shared by all rules on that parameter.
+  interface Scan {
+    column: string;
+    def: ParameterDef;
+    series: { i: number; t: number | null; value: number | boolean }[]; // valid values, time order
+    invalidInWindow: number;
+    missingLatest: boolean;
+    conflict: boolean;
+    ma: number | null;
+  }
+  const scans = new Map<string, Scan | null>();
+  const order =
+    latestT === null ? rows.map((_, i) => i) : valid.map((v) => v.i);
+  const scanParameter = (name: string): Scan | null => {
+    if (scans.has(name)) return scans.get(name)!;
+    const def = paramDef.get(name);
+    const column = findColumn(name);
+    if (!def || !column) {
+      scans.set(name, null);
+      return null;
+    }
+    const series: Scan["series"] = [];
+    let invalidInWindow = 0;
+    const seen = new Map<number, number | boolean>();
+    let conflict = false;
+    for (const i of order) {
+      const { value, invalid } = readValue(def, rows[i]?.[column]);
+      if (invalid && inWindow(i)) invalidInWindow++;
+      if (value === null) continue;
+      const t = times[i] ?? null;
+      if (t !== null && inWindow(i)) {
+        const prev = seen.get(t);
+        if (prev !== undefined && prev !== value) conflict = true;
+        seen.set(t, value);
+      }
+      series.push({ i, t, value });
+    }
+    const latestRow = latestIdx >= 0 ? latestIdx : rows.length - 1;
+    const missingLatest =
+      latestRow >= 0 &&
+      readValue(def, rows[latestRow]?.[column]).value === null;
+    let ma: number | null = null;
+    if (def.type === "number" && tc && series.length) {
+      const pts = series.map((s) => ({ t: s.t, value: s.value as number }));
+      ma = movingAverage(pts)[pts.length - 1]?.avg ?? null;
+    }
+    const scan: Scan = {
+      column,
+      def,
+      series,
+      invalidInWindow,
+      missingLatest,
+      conflict,
+      ma,
+    };
+    scans.set(name, scan);
+    if (column !== name)
+      addDq({
+        code: "column_name_case",
+        message: `Column "${column}" was matched to parameter ${name} ignoring letter case.`,
+        parameter: name,
+        blocksSafe: false,
+      });
+    return scan;
+  };
+
+  // ---- Rules ------------------------------------------------------------
+  const evaluations: RuleEvaluation[] = [];
+  const unsafe: string[] = [];
+  const caution: string[] = [];
+  const unverifiedRequired: string[] = [];
+  const checked = new Set<string>();
+  const degree = config.mineContext.degreeOfGassiness;
+
+  // Fire-gas ratios from the newest row, for Graham's applicability and cross-checks.
+  const latestRow = latestIdx >= 0 ? rows[latestIdx] : rows[rows.length - 1];
+  const gas = (name: string) => {
+    const s = scanParameter(name);
+    if (!s || !latestRow) return null;
+    const v = readValue(s.def, latestRow[s.column]).value;
+    return typeof v === "number" ? v : null;
+  };
+  const derived =
+    latestRow &&
+    deriveRatios({
+      O2_vol_pct: gas("O2_vol_pct"),
+      CO2_vol_pct: gas("CO2_vol_pct"),
+      CH4_vol_pct: gas("CH4_vol_pct"),
+      CO_ppm: gas("CO_ppm"),
+      H2_ppm: gas("H2_ppm"),
+      C2H4_ppm: gas("C2H4_ppm"),
+      C2H2_ppm: gas("C2H2_ppm"),
+    });
+
+  for (const rule of config.rules) {
+    const def = paramDef.get(rule.parameter);
+    const fieldUnit = def?.unit ?? rule.unit;
+    const conv = (v: number | null) =>
+      v === null || rule.unit === "boolean"
+        ? v
+        : convert(v, rule.unit, fieldUnit);
+    const ev: RuleEvaluation = {
+      ruleId: rule.id,
+      parameter: rule.parameter,
+      unit: fieldUnit,
+      ruleUnit: rule.unit,
+      operator: rule.operator,
+      warning: conv(rule.warningThreshold),
+      critical: conv(rule.criticalThreshold),
+      severity: rule.severity,
+      verificationStatus: rule.verificationStatus,
+      enabled: rule.enabled,
+      requiredForSafe: rule.requiredForSafe,
+      sourceDocument: rule.source.document,
+      sourceClause: rule.source.clause,
+      sourceUrl: rule.source.url ?? null,
+      officialCopyChecked:
+        rule.source.verification?.officialCopyChecked ?? null,
+      contextNote: rule.context.note ?? null,
+      result: "not_evaluated",
+      notEvaluatedReason: null,
+      effect: "none",
+      latestValue: null,
+      latestAt: null,
+      worstValue: null,
+      worstAt: null,
+      movingAvg1h: null,
+      explanation: "",
+    };
+    const skip = (reason: string) => {
+      ev.notEvaluatedReason = reason;
+      ev.explanation = reason;
+      if (rule.requiredForSafe) {
+        unverifiedRequired.push(rule.id);
+        caution.push(
+          `Required check "${rule.id}" (${rule.parameter}) was not performed: ${reason}`,
         );
+      }
+      evaluations.push(ev);
+    };
+
+    const scan = scanParameter(rule.parameter);
+    if (scan) {
+      const last = scan.series[scan.series.length - 1];
+      if (last) {
+        ev.latestValue = last.value;
+        ev.latestAt = label(last.i);
+      }
+      ev.movingAvg1h = scan.ma;
+    }
+
+    if (rule.verificationStatus === "requires_verification") {
+      skip("threshold not verified (requires verification)");
       continue;
     }
-    const levels: RuleLevel[] = [];
-    for (const col of cols) {
-      covered.add(col);
-      const stats = dataset.columns.find((c) => c.name === col)?.stats;
-      const ev: RuleEvaluation = {
-        ruleId: rule.id,
-        label: rule.label,
-        column: col,
-        unit: rule.unit,
-        direction: rule.direction,
-        warning: rule.warning ?? null,
-        critical: rule.critical,
-        source: rule.source,
-        level: "ok",
-        latestValue: null,
-        latestAt: null,
-        worstValue: null,
-        worstAt: null,
-        movingAvg1h: null,
-        explanation: "",
-      };
-
-      let invalidInWindow = 0;
-      let validInWindow = 0;
-      let latestIdx = -1;
-      let worstIdx = -1;
-      let earlierCriticalIdx = -1;
-      let abnormalIdx = -1;
-      const valid = (v: unknown): v is number =>
-        typeof v === "number" &&
-        Number.isFinite(v) &&
-        (!rule.validRange ||
-          (v >= rule.validRange[0] && v <= rule.validRange[1]));
-
-      dataset.rows.forEach((row, i) => {
-        const v = row[col];
-        const current = inWindow(i);
-        if (!valid(v)) {
-          if (current && v !== null && v !== undefined) invalidInWindow++;
-          return;
-        }
-        if (tc && times[i] === null) return;
-        if (
-          latestIdx === -1 ||
-          (times[i] ?? i) >= (times[latestIdx] ?? latestIdx)
-        )
-          latestIdx = i;
-        if (current) {
-          validInWindow++;
-          if (
-            worstIdx === -1 ||
-            worse(v, dataset.rows[worstIdx]![col] as number, rule.direction)
-          )
-            worstIdx = i;
-          if (
-            stats &&
-            stats.std > 0 &&
-            Math.abs((v - stats.mean) / stats.std) >= 3
-          )
-            abnormalIdx = i;
-        } else if (breach(v, rule.critical, rule.direction)) {
-          earlierCriticalIdx = i;
-        }
-      });
-
-      if (latestIdx >= 0) {
-        ev.latestValue = dataset.rows[latestIdx]![col] as number;
-        ev.latestAt = label(latestIdx);
-        if (tc) {
-          const ma = movingAverage(
-            dataset.rows.map((r, i) => ({
-              t: times[i] ?? null,
-              value: valid(r[col]) ? (r[col] as number) : null,
-            })),
-          );
-          ev.movingAvg1h = ma[latestIdx]?.avg ?? null;
-        }
-      }
-      if (worstIdx >= 0) {
-        ev.worstValue = dataset.rows[worstIdx]![col] as number;
-        ev.worstAt = label(worstIdx);
-      }
-
-      const name = `${rule.label} (${col})`;
-      const limitText = `${rule.direction === "above" ? "≥" : "≤"} ${fmt(rule.critical, rule.unit)}`;
-
-      // Duplicate timestamps with different values are conflicting readings.
-      if (tc) {
-        const seen = new Map<number, number>();
-        let conflict = false;
-        dataset.rows.forEach((r, i) => {
-          const t = times[i];
-          const v = r[col];
-          if (t === null || t === undefined || !inWindow(i) || !valid(v))
-            return;
-          const prev = seen.get(t);
-          if (prev !== undefined && prev !== v) conflict = true;
-          seen.set(t, v);
-        });
-        if (conflict) {
-          notes.push(
-            `${name}: different values were logged for the same timestamp.`,
-          );
-          insufficient.push(
-            `${name} has conflicting readings at the same timestamp.`,
-          );
-        }
-      }
-
-      if (
-        ev.worstValue !== null &&
-        breach(ev.worstValue, rule.critical, rule.direction)
-      ) {
-        ev.level = "critical";
-        ev.explanation = `${fmt(ev.worstValue, rule.unit)} at ${ev.worstAt} breaches the critical limit (${limitText}; ${rule.source}).`;
-        critical.push(`${name}: ${ev.explanation}`);
-      } else if (latestIdx === -1 || validInWindow === 0) {
-        ev.level = invalidInWindow > 0 ? "invalid" : "no_data";
-        ev.explanation =
-          invalidInWindow > 0
-            ? `All ${invalidInWindow} reading(s) in the current window are invalid.`
-            : "No valid reading in the current window.";
-        insufficient.push(`${name}: ${ev.explanation}`);
-      } else if (
-        tc &&
-        lastT !== null &&
-        times[latestIdx] !== null &&
-        lastT - (times[latestIdx] as number) >
-          (rule.maxStalenessMinutes ?? settings.defaultMaxStalenessMinutes) *
-            60_000
-      ) {
-        ev.level = "stale";
-        ev.explanation = `Last valid reading (${ev.latestAt}) is ${minutes(lastT - (times[latestIdx] as number))} older than the rest of the data.`;
-        insufficient.push(`${name}: ${ev.explanation}`);
-      } else if (
-        rule.warning !== undefined &&
-        ev.worstValue !== null &&
-        breach(ev.worstValue, rule.warning, rule.direction)
-      ) {
-        ev.level = "warning";
-        ev.explanation = `${fmt(ev.worstValue, rule.unit)} at ${ev.worstAt} is at or beyond the warning level (${rule.direction === "above" ? "≥" : "≤"} ${fmt(rule.warning, rule.unit)}; ${rule.source}).`;
-        caution.push(`${name}: ${ev.explanation}`);
-      } else {
-        ev.level = "ok";
-        ev.explanation = `Within limits in the current window (worst ${fmt(ev.worstValue, rule.unit)}; critical ${limitText}).`;
-      }
-
-      if (invalidInWindow > 0 && ev.level !== "invalid") {
-        notes.push(
-          `${name}: ${invalidInWindow} invalid reading(s) in the current window were ignored.`,
-        );
-        if (ev.level === "ok")
-          caution.push(
-            `${name}: some readings in the current window are invalid and need checking.`,
-          );
-      }
-      if (earlierCriticalIdx >= 0 && ev.level !== "critical") {
-        caution.push(
-          `${name}: ${fmt(dataset.rows[earlierCriticalIdx]![col] as number, rule.unit)} at ${label(earlierCriticalIdx)} breached the critical limit earlier in the file.`,
-        );
-      }
-      if (abnormalIdx >= 0 && ev.level === "ok") {
-        caution.push(
-          `${name}: an abnormal reading (|z| ≥ 3) at ${label(abnormalIdx)} needs verification.`,
-        );
-      }
-      levels.push(ev.level);
-      evaluations.push(ev);
+    if (!rule.enabled) {
+      skip(
+        rule.verificationStatus === "provisional"
+          ? "provisional rule, disabled by default"
+          : `disabled: ${rule.context.note ?? "not applicable to this site"}`,
+      );
+      continue;
     }
-    // Several sensors for the same rule that disagree.
     if (
-      new Set(levels).size > 1 &&
-      levels.some((l) => l === "critical" || l === "warning")
+      rule.context.gassinessDegree &&
+      rule.context.gassinessDegree !== degree
     ) {
-      notes.push(
-        `Sensors for "${rule.label}" disagree (${cols.join(", ")}); the worst reading was used.`,
-      );
-      if (!levels.includes("critical"))
-        caution.push(
-          `Sensors for "${rule.label}" disagree and need cross-checking.`,
-        );
+      ev.notEvaluatedReason =
+        degree === null
+          ? `applies only to degree ${rule.context.gassinessDegree} gassy mines; degree of gassiness is not set`
+          : `applies only to degree ${rule.context.gassinessDegree} gassy mines (this mine: degree ${degree})`;
+      ev.explanation = ev.notEvaluatedReason;
+      evaluations.push(ev);
+      continue;
     }
-  }
+    if (!scan) {
+      addDq({
+        code: "missing_parameter",
+        message: `${rule.parameter} is not in this data, so rule "${rule.id}" was not checked.`,
+        parameter: rule.parameter,
+        blocksSafe: rule.requiredForSafe || isVerified(rule.verificationStatus),
+      });
+      skip(`${rule.parameter} is not in this data`);
+      continue;
+    }
+    checked.add(scan.column);
 
-  const unassessed = dataset.numericNames.filter((n) => !covered.has(n));
-  if (rules.length > 0 && covered.size === 0) {
-    insufficient.push(
-      "None of the configured thresholds apply to the parameters in this file.",
-    );
-  }
-  if (unassessed.length > 0 && covered.size > 0) {
-    notes.push(
-      `No configured threshold for: ${unassessed.join(", ")}. These were not assessed.`,
-    );
-  }
-  for (const c of dataset.columns) {
-    if (c.stats && c.stats.missingPct >= 10)
-      notes.push(
-        `${c.name}: ${Number(c.stats.missingPct.toFixed(1))}% of values are missing.`,
+    // Data quality for this parameter.
+    const blocks = rule.requiredForSafe || isVerified(rule.verificationStatus);
+    if (scan.invalidInWindow > 0)
+      addDq({
+        code: "invalid_values",
+        message: `${rule.parameter}: ${scan.invalidInWindow} invalid reading(s) in the evaluation window were ignored.`,
+        parameter: rule.parameter,
+        blocksSafe: blocks,
+      });
+    if (scan.conflict)
+      addDq({
+        code: "conflict",
+        message: `${rule.parameter}: different values were logged for the same timestamp.`,
+        parameter: rule.parameter,
+        blocksSafe: blocks,
+      });
+    if (scan.missingLatest)
+      addDq({
+        code: "missing_latest",
+        message: `${rule.parameter} is missing or invalid in the newest reading (${latestTimestamp ?? "last row"}); a missing reading is not treated as normal.`,
+        parameter: rule.parameter,
+        blocksSafe: blocks,
+      });
+    const lastValid = scan.series[scan.series.length - 1];
+    if (
+      lastValid &&
+      latestT !== null &&
+      lastValid.t !== null &&
+      latestT - lastValid.t > paramStaleMs
+    ) {
+      addDq({
+        code: "stale_parameter",
+        message: `${rule.parameter}: last valid reading (${label(lastValid.i)}) is ${ago(latestT - lastValid.t)} older than the newest data.`,
+        parameter: rule.parameter,
+        blocksSafe: blocks,
+      });
+    }
+
+    // Graham's ratio is not meaningful at small oxygen deficiency (CIMFR).
+    if (rule.parameter === "Grahams_Ratio" && derived && !derived.reliable) {
+      skip(
+        `oxygen deficiency is ${derived.oxygenDeficiency.toFixed(2)}%, below ${MIN_OXYGEN_DEFICIENCY}%, so Graham's ratio is not meaningful (CIMFR)`,
       );
+      continue;
+    }
+
+    const windowSeries = scan.series.filter((s) => inWindow(s.i));
+    if (windowSeries.length === 0) {
+      addDq({
+        code: "missing_values",
+        message: `${rule.parameter}: no valid reading in the evaluation window.`,
+        parameter: rule.parameter,
+        blocksSafe: blocks,
+      });
+      skip(
+        `no valid ${rule.parameter} reading in the last ${dq.evaluationWindowMinutes} min`,
+      );
+      continue;
+    }
+
+    // Evaluate.
+    let critical = false;
+    let warning = false;
+    let detail = "";
+    if (rule.operator === "is_true") {
+      const hit = [...windowSeries].reverse().find((s) => s.value === true);
+      ev.worstValue = hit ? true : false;
+      ev.worstAt = hit ? label(hit.i) : null;
+      if (hit) {
+        if (rule.severity === "critical") critical = true;
+        else warning = true;
+        detail = `positive detection at ${label(hit.i)}`;
+      }
+    } else if (rule.operator === "steady_increase") {
+      const n = rule.consecutiveIncreases ?? 3;
+      const tail = scan.series.slice(-(n + 1)).map((s) => s.value as number);
+      const rising =
+        tail.length === n + 1 &&
+        tail.every((v, k) => k === 0 || v > tail[k - 1]!);
+      ev.worstValue =
+        (scan.series[scan.series.length - 1]?.value as number) ?? null;
+      ev.worstAt = ev.latestAt;
+      if (rising) {
+        warning = true;
+        detail = `${n} successive increases (${tail.map((v) => Number(v.toPrecision(4))).join(" → ")})`;
+      }
+    } else {
+      const nums = windowSeries as { i: number; value: number }[];
+      const worst = nums.reduce((a, b) =>
+        isAbove(rule.operator)
+          ? b.value > a.value
+            ? b
+            : a
+          : b.value < a.value
+            ? b
+            : a,
+      );
+      ev.worstValue = worst.value;
+      ev.worstAt = label(worst.i);
+      if (
+        ev.critical !== null &&
+        breaches(worst.value, ev.critical, rule.operator)
+      ) {
+        critical = true;
+        detail = `${fmt(worst.value, fieldUnit)} at ${label(worst.i)} ${OP_TEXT[rule.operator]} critical ${fmt(ev.critical, fieldUnit)}`;
+      } else if (
+        ev.warning !== null &&
+        breaches(worst.value, ev.warning, rule.operator)
+      ) {
+        warning = true;
+        detail = `${fmt(worst.value, fieldUnit)} at ${label(worst.i)} ${OP_TEXT[rule.operator]} warning ${fmt(ev.warning, fieldUnit)}`;
+      }
+      // A critical breach earlier in the file (outside the window).
+      if (!critical && ev.critical !== null) {
+        const earlier = scan.series
+          .filter(
+            (s) =>
+              !inWindow(s.i) &&
+              breaches(s.value as number, ev.critical!, rule.operator),
+          )
+          .pop();
+        if (earlier && isVerified(rule.verificationStatus)) {
+          caution.push(
+            `${rule.parameter}: ${fmt(earlier.value as number, fieldUnit)} at ${label(earlier.i)} breached the critical limit earlier in the file (${rule.source.clause}).`,
+          );
+        }
+      }
+    }
+
+    const tag = `${rule.parameter} [${rule.id}, ${VERIFICATION_LABEL[rule.verificationStatus]}]`;
+    if (critical) {
+      ev.result = "critical";
+      if (isVerified(rule.verificationStatus)) {
+        ev.effect = "UNSAFE";
+        unsafe.push(`${tag}: ${detail} — ${rule.source.clause}.`);
+      } else {
+        ev.effect = "CAUTION";
+        caution.push(
+          `${tag}: ${detail} (provisional rule: needs verification, cannot set UNSAFE).`,
+        );
+      }
+    } else if (warning) {
+      ev.result = "warning";
+      ev.effect = "CAUTION";
+      caution.push(`${tag}: ${detail}.`);
+    } else {
+      ev.result = "ok";
+    }
+    ev.explanation =
+      ev.result === "ok"
+        ? `Within limits in the last ${dq.evaluationWindowMinutes} min (worst ${fmt(ev.worstValue, fieldUnit)}).`
+        : `${detail}. ${rule.explanation}`;
+    if (rule.requiredForSafe && !isVerified(rule.verificationStatus)) {
+      unverifiedRequired.push(rule.id);
+      caution.push(
+        `Required check "${rule.id}" is ${VERIFICATION_LABEL[rule.verificationStatus].toLowerCase()}, not verified.`,
+      );
+    }
+    evaluations.push(ev);
   }
 
+  // ---- Derived indicators: supplied vs computed -----------------------------
+  if (derived && derived.reliable && latestRow) {
+    const tol = dq.derivedIndicatorTolerancePct / 100;
+    const check = (name: string, computed: number | null) => {
+      const supplied = gas(name);
+      if (supplied === null || computed === null) return;
+      const close = (a: number, b: number) =>
+        Math.abs(a - b) <= Math.max(tol * Math.abs(b), 0.01);
+      if (close(supplied, computed)) return;
+      const asFraction =
+        name === "Grahams_Ratio" && close(supplied, computed / 100);
+      addDq({
+        code: "derived_mismatch",
+        message: asFraction
+          ? `Grahams_Ratio (${supplied}) looks like a fraction, but the configured unit is % (computed ${computed.toFixed(3)}%). Check how the ratio is produced.`
+          : `${name} in the data (${supplied}) disagrees with the value computed from the gas readings (${computed.toFixed(3)}) by more than ${dq.derivedIndicatorTolerancePct}%.`,
+        parameter: name,
+        blocksSafe: true,
+      });
+    };
+    check("Grahams_Ratio", derived.grahamsRatio);
+    check("Trickett_Ratio", derived.trickettRatio);
+  }
+
+  // ---- Status -----------------------------------------------------------
+  const verifiedChecked = evaluations.filter(
+    (e) => e.result !== "not_evaluated" && isVerified(e.verificationStatus),
+  );
+  const blocking = quality.filter((q) => q.blocksSafe);
   let status: SafetyStatus;
   let reasons: string[];
-  if (critical.length > 0) {
+  const dqReasons = blocking.map((q) => `Data quality: ${q.message}`);
+  if (unsafe.length) {
     status = "UNSAFE";
-    reasons = [...critical, ...insufficient, ...caution];
-  } else if (insufficient.length > 0) {
-    status = "INSUFFICIENT_DATA";
-    reasons = [...insufficient, ...caution];
-  } else if (caution.length > 0) {
+    reasons = [...unsafe, ...caution, ...dqReasons];
+  } else if (
+    caution.length ||
+    blocking.length ||
+    verifiedChecked.length === 0
+  ) {
     status = "CAUTION";
-    reasons = caution;
+    reasons = [...caution, ...dqReasons];
+    if (verifiedChecked.length === 0)
+      reasons.push("No verified rule could be checked against this data.");
   } else {
     status = "SAFE";
     reasons = [
-      `All ${evaluations.length} configured check(s) passed for readings up to ${dataAsOf}.`,
+      `All ${verifiedChecked.length} verified check(s) passed on current data (newest reading ${latestTimestamp}).`,
       "This is a rule-based check of the supplied readings, not a certification that the mine is safe.",
     ];
   }
+  const officialCopyCaveat = evaluations.some(
+    (e) =>
+      e.enabled &&
+      isVerified(e.verificationStatus) &&
+      e.officialCopyChecked === false,
+  );
+  if (officialCopyCaveat) {
+    reasons.push(
+      "Verified regulatory rules were checked against a reproduction of the Gazette, not the official DGMS copy; amendments were not checked (see docs/safety-sources.md).",
+    );
+  }
 
+  // ---- Next actions -----------------------------------------------------
   const actions: string[] = [];
   for (const e of evaluations) {
-    const name = `${e.label} (${e.column})`;
-    if (e.level === "critical")
+    if (e.result === "critical" && e.operator === "is_true") {
       actions.push(
-        `Verify ${name} with an independent instrument and follow the site response procedure for this limit (${e.source}).`,
+        `Treat ${e.parameter} as a possible fire (${e.sourceClause.split(":")[0]}): follow the site fire procedure, withdraw persons as required, and have a competent person confirm.`,
       );
-    else if (e.level === "warning")
+    } else if (e.result === "critical") {
       actions.push(
-        `Increase monitoring of ${name} and confirm the trend before the next shift.`,
+        `Verify ${e.parameter} with an independent instrument and act on ${e.sourceClause.split(":")[0]} without delay.`,
+      );
+    } else if (e.result === "warning") {
+      actions.push(
+        `Increase monitoring of ${e.parameter} and confirm the trend (${e.sourceClause.split(":")[0]}).`,
+      );
+    }
+  }
+  for (const q of blocking) {
+    if (q.code === "stale_data")
+      actions.push(
+        "Check the sensor data feed: the newest reading is not current.",
       );
     else if (
-      e.level === "stale" ||
-      e.level === "no_data" ||
-      e.level === "invalid"
+      q.parameter &&
+      [
+        "missing_latest",
+        "stale_parameter",
+        "invalid_values",
+        "missing_values",
+        "missing_parameter",
+      ].includes(q.code)
     )
+      actions.push(`Check the ${q.parameter} sensor and logger.`);
+    else if (q.code === "derived_mismatch")
       actions.push(
-        `Check the ${e.column} sensor and logger: readings are ${e.level === "stale" ? "stale" : e.level === "invalid" ? "invalid" : "missing"}.`,
+        `Check how ${q.parameter} is calculated and that its unit matches the configuration.`,
       );
   }
-  if (rules.length === 0)
-    actions.push(
-      "Add verified site thresholds (src/config/safety-rules.ts or a thresholds file) so readings can be checked against limits.",
-    );
-  else if (covered.size === 0)
-    actions.push(
-      "Check that the thresholds file uses the same column names as this CSV.",
-    );
-  if (
-    status === "INSUFFICIENT_DATA" &&
-    lastT !== null &&
-    now - lastT > settings.maxDataAgeMinutes * 60_000
-  )
-    actions.push("Load a current log to assess present conditions.");
+  for (const id of new Set(unverifiedRequired)) {
+    const r = config.rules.find((x) => x.id === id);
+    if (r)
+      actions.push(
+        `Configure a verified ${r.parameter} threshold (site thresholds file) so rule "${id}" can be checked.`,
+      );
+  }
+
+  // ---- Summary ----------------------------------------------------------
+  const presentFields = dataset.columns
+    .filter((c) => c.type !== "time")
+    .map((c) => c.name);
+  const summary = {
+    total: config.rules.length,
+    enabled: config.rules.filter((r) => r.enabled).length,
+    evaluated: evaluations.filter((e) => e.result !== "not_evaluated").length,
+    verifiedRegulatory: config.rules.filter(
+      (r) => r.enabled && r.verificationStatus === "verified_regulatory",
+    ).length,
+    verifiedSite: config.rules.filter(
+      (r) => r.enabled && r.verificationStatus === "verified_site",
+    ).length,
+    provisional: config.rules.filter(
+      (r) => r.enabled && r.verificationStatus === "provisional",
+    ).length,
+    requiresVerification: config.rules.filter(
+      (r) => r.verificationStatus === "requires_verification",
+    ).length,
+  };
 
   return {
     status,
     reasons,
     evaluations,
-    dataQualityNotes: [...new Set(notes)],
-    nextActions: [...new Set(actions)].slice(0, 8),
-    unassessedParameters: unassessed,
-    dataAsOf,
-    rulesSource:
-      options.rulesSource ?? (rules.length ? "configured rules" : "none"),
-    ruleCount: rules.length,
+    dataQuality: quality,
+    nextActions: [...new Set(actions)].slice(0, 10),
+    triggeredRuleIds: evaluations
+      .filter((e) => e.result === "critical" || e.result === "warning")
+      .map((e) => e.ruleId),
+    latestTimestamp,
+    latestTimestampIso:
+      latestT === null ? null : new Date(latestT).toISOString(),
+    dataAgeMinutes: dataAgeMs === null ? null : Math.round(dataAgeMs / 60_000),
+    isStale,
+    samplingIntervalSeconds: intervalMs ? Math.round(intervalMs / 1000) : null,
+    rulesSummary: summary,
+    unverifiedRequired: [...new Set(unverifiedRequired)],
+    unassessedParameters: presentFields.filter((f) => !checked.has(f)),
+    configName: config.name,
+    officialCopyCaveat,
   };
 }
 
@@ -445,15 +825,36 @@ const clipText = (t: string, n = 300) =>
 
 /** Size-limited copy for sending to the analyst (keeps the prompt small). */
 export function compactAssessment(a: SafetyAssessment): SafetyAssessment {
+  // Keep evaluated and required rules first; drop disabled monitoring rows beyond the limit.
+  const rank = (e: RuleEvaluation) =>
+    e.result === "critical"
+      ? 0
+      : e.result === "warning"
+        ? 1
+        : e.result === "ok"
+          ? 2
+          : e.requiredForSafe
+            ? 3
+            : 4;
   return {
     ...a,
-    reasons: a.reasons.slice(0, 8).map((r) => clipText(r)),
-    evaluations: a.evaluations.slice(0, 12).map((e) => ({
-      ...e,
-      explanation: clipText(e.explanation),
-      source: clipText(e.source, 200),
-    })),
-    dataQualityNotes: a.dataQualityNotes.slice(0, 8).map((n) => clipText(n)),
+    reasons: a.reasons.slice(0, 10).map((r) => clipText(r)),
+    evaluations: [...a.evaluations]
+      .sort((x, y) => rank(x) - rank(y))
+      .slice(0, 16)
+      .map((e) => ({
+        ...e,
+        explanation: clipText(e.explanation),
+        sourceDocument: clipText(e.sourceDocument, 200),
+        sourceClause: clipText(e.sourceClause, 300),
+        contextNote: e.contextNote ? clipText(e.contextNote, 200) : null,
+        notEvaluatedReason: e.notEvaluatedReason
+          ? clipText(e.notEvaluatedReason, 200)
+          : null,
+      })),
+    dataQuality: a.dataQuality
+      .slice(0, 10)
+      .map((q) => ({ ...q, message: clipText(q.message) })),
     nextActions: a.nextActions.slice(0, 8).map((n) => clipText(n)),
     unassessedParameters: a.unassessedParameters.slice(0, 30),
   };

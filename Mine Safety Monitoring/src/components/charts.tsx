@@ -70,7 +70,8 @@ export function TrendConsole({ dataset, selected, normalized, onToggle, onNormal
       const out = { ...r };
       for (const col of selected) {
         const first = typeof base[0]?.[col] === "number" ? (base[0][col] as number) : 0;
-        out[col] = first !== 0 ? Number((((r[col] as number) / first) * 100).toFixed(2)) : 0;
+        const v = r[col];
+        out[col] = first !== 0 && typeof v === "number" ? Number(((v / first) * 100).toFixed(2)) : 0;
       }
       return out;
     });
@@ -227,7 +228,9 @@ export function MiniChart({ dataset, column, colorIndex }: MiniChartProps) {
     const out = base.map((r, i) => {
       const avg = ma?.[i]?.avg ?? null;
       const z =
-        stats && stats.std > 0 ? Math.abs(((r[column] as number) - stats.mean) / stats.std) : 0;
+        stats && stats.std > 0 && typeof r[column] === "number"
+          ? Math.abs(((r[column] as number) - stats.mean) / stats.std)
+          : 0;
       return { ...r, _ma: avg === null ? null : Number(avg.toFixed(3)), _anom: z >= 3 };
     });
     return { rows: out, sparse: interval !== null && interval >= MOVING_AVERAGE_WINDOW_MS };

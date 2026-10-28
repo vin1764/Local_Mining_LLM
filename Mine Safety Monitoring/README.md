@@ -257,66 +257,72 @@ parameter's latest value against its 1-hour moving average.
 
 ## 5a. Safety classification
 
-Every analysis shows a safety status first, before the AI text:
+Every analysis shows a safety status first, before the AI text. There are only
+three statuses:
 
 | Status | Meaning |
 | --- | --- |
-| **UNSAFE** (red, ✕ shield) | A configured **critical** limit is breached by a valid reading in the current window |
-| **INSUFFICIENT DATA** (grey, ? shield) | No applicable verified thresholds, a required parameter is missing, readings are stale, invalid or conflicting, or the data is not current |
-| **CAUTION** (amber, ! shield) | A **warning** limit is breached, a critical breach happened earlier in the file, an abnormal reading (abs z ≥ 3) needs verification, or sensors disagree |
-| **SAFE** (green, ✓ shield) | Every applicable configured check passed on adequate, current data. **Not a certification that the mine is safe.** |
+| **UNSAFE** (red, ✕ shield) | An enabled, **verified** rule's critical threshold is breached by a valid reading in the last 60 minutes (or flame/smoke is detected) |
+| **CAUTION** (amber, ! shield) | A warning threshold or provisional rule is triggered, **or** the data is stale, missing, invalid or conflicting, **or** a required rule is unverified or could not be checked |
+| **SAFE** (green, ✓ shield) | Current, valid data, every required rule verified and checked, every check passed. **Not a certification that the mine is safe.** |
+
+Data-quality problems are listed separately under the status (marked
+**PREVENTS SAFE** when they do). The panel also shows the newest timestamp,
+its age (CURRENT or STALE), the sampling interval, how many rules are enabled
+and checked with their verification status, and a table of every rule with
+its result, latest value, 1-hour average, worst value, thresholds and source.
 
 - **Deterministic.** The status comes from `assessSafety()` in
-  `src/lib/safety/assess.ts`, never from the model. Priority: UNSAFE, then
-  INSUFFICIENT DATA, then CAUTION, then SAFE.
-- **Current window** = readings in the last 60 minutes of the file. SAFE also
-  requires the newest reading to be at most 60 minutes old by the clock, so
-  historical files can never be SAFE. Settings are in `ASSESSMENT_SETTINGS`.
-- **The model explains, it does not decide.** It must repeat the status. If it
-  reports a different status, calls conditions "safe" when they are not, says
-  "the mine is safe" at all, or reports a breach the rules did not find, the app
-  retries once. If that fails, it keeps the rule-based status and marks the AI
-  text **needs review**.
-- **Works without AI.** The status, evidence, measurements and rule-based next
-  actions are shown even when no model is available.
+  `src/lib/safety/assess.ts`, never from the model, and works with no AI.
+- **The model explains, it does not decide.** It receives the status, the
+  measurements, the thresholds and their sources, the triggered rules, the
+  newest timestamp and the data-quality warnings. If it reports a different
+  status, calls conditions "safe", or reports a breach the rules did not find,
+  the app retries once, then keeps the rule-based status and marks the AI text
+  **needs review**.
 
-### Thresholds (none are shipped)
+### Built-in rules (Coal Mines Regulations, 2017)
 
-The app ships with **no thresholds**, because it must not guess your site's legal
-or engineering limits. Until you add verified ones, every analysis is
-**INSUFFICIENT DATA**. Add them in either place:
+`src/config/safety-rules.json` ships 24 rules covering all 18 sensor fields.
+Sources and verbatim clauses are in [docs/safety-sources.md](docs/safety-sources.md).
 
-1. **In code:** `src/config/safety-rules.ts` (`SAFETY_RULES`). Applies to every user.
-2. **In the app:** **LOAD SITE THRESHOLDS (JSON)** in the safety panel. This is
-   stored in that browser only, and replaces the code rules while loaded.
+| Checked by default | Threshold | Source |
+| --- | --- | --- |
+| `CH4_vol_pct` | warning > 0.8, critical > 1.25 %vol | CMR 2017 Reg. 153(2)(c), 169(1)(c)(i) |
+| `O2_vol_pct` | critical < 19 %vol | Reg. 153(2)(b) |
+| `CO2_vol_pct` | critical > 0.5 %vol | Reg. 153(2)(b) |
+| `YOLO_Flame_Detected`, `YOLO_Smoke_Detected` | positive detection | Reg. 138(1) |
+| `CH4_vol_pct` by degree of gassiness | ≥ 0.1 / 0.5 / 1.25 %vol | Reg. 166(1), only when `degreeOfGassiness` is set |
 
-Format (take every number from your regulator or site standard, and cite it in `source`):
+Verified but **off by default** because they depend on where the sensor is:
+methane in return air (0.75 %vol), wet-bulb temperature (30.5 / 33.5 °C),
+air velocity at the outbye ventilation connection (30 m/min).
 
-```text
-{
-  "version": 1,
-  "name": "Site standard rev 3",
-  "rules": [
-    {
-      "id": "methane",
-      "label": "Methane",
-      "columns": ["methane_pct"],         // CSV column names (case-insensitive)
-      "unit": "%",
-      "direction": "above",               // "above" = higher is worse, "below" = lower is worse
-      "warning": <number>,                // optional
-      "critical": <number>,
-      "source": "<regulation / site standard, clause>",
-      "required": true,                   // file without this parameter cannot be SAFE
-      "maxStalenessMinutes": <number>,    // optional, default 60
-      "validRange": [<min>, <max>]        // optional, readings outside are invalid
-    }
-  ]
-}
-```
+**Provisional** (off by default; can only give CAUTION): Graham's ratio
+0.5 / 1.0 % and its steady increase, ethylene and acetylene presence (CIMFR).
 
-(The comments are for explanation only; the real file must be plain JSON.)
-Invalid files are rejected with a message. Warning must be on the safe side of
-critical, and every rule needs a `source`.
+**No verified threshold** (shown, not checked): CO, H2, coal seam and
+thermal IR temperature, barometric pressure, smoke obscuration, Trickett
+ratio, Explosion Risk Index.
+
+CMR 2017 has no numeric CO limit, so **the built-in rules alone always give
+CAUTION** ("required check co-site-limit is not verified"). Add your site's
+verified CO limit with a site thresholds file to make SAFE possible.
+
+The regulation text was checked against a reproduction of the Gazette and an
+independent copy. The official DGMS copy and later amendments could not be
+checked; the panel says so under every assessment.
+
+### Site thresholds (LOAD SITE THRESHOLDS (JSON))
+
+A site file adds or replaces rules and sets the degree of gassiness, the
+expected sampling interval and the stale timeout. It is validated and
+previewed before it is applied, saved in that browser only, and an invalid file
+never replaces the active rules. Format, merge policy and instructions for new
+datasets: **[docs/site-thresholds.md](docs/site-thresholds.md)**.
+
+To try it with invented data: `node scripts/make-sample-sensor-csv.mjs normal`
+(or `methane`, `low-oxygen`, `smoke`, `stale`, `heating`).
 
 ## 5b. One-hour moving average
 
@@ -409,17 +415,18 @@ npm registry. Neither is used at runtime.
 - **Consistency checks are heuristic:** they catch wrong directions and invented
   numbers. They cannot catch every mistake, for example a real date attached to
   the wrong value.
-- **No safety thresholds are shipped.** Without verified thresholds every
-  analysis is INSUFFICIENT DATA (see section 5a). Severities on the statistical
-  findings are trend/outlier ratings, not safety limits.
+- **Built-in thresholds are CMR 2017 only** and were not checked against the
+  official DGMS copy or amendments. Without a site CO limit the status is never
+  SAFE (see section 5a). Severities on the statistical findings are
+  trend/outlier ratings, not safety limits.
 - **AI wording can misattribute.** The safety checks catch a wrong status, "safe"
-  claims and breach claims under a non-UNSAFE status, but not every slip. For
-  example, under UNSAFE the model once wrote that "methane and CO2" exceeded
-  critical limits when only methane had a limit. The rule-based evidence table
-  is authoritative.
+  claims, breach claims under a non-UNSAFE status, and a breach claimed for a
+  parameter whose rules passed (e.g. "CO2 exceeded critical limits" when only
+  methane did). They cannot catch every slip, such as a parameter referred to by
+  an unusual name. The rule-based evidence table is authoritative.
 - **Column typing quirk (existing):** a numeric column whose values are all
   negative (e.g. `-5`) is detected as a time column, so it is not assessed. For a
-  required parameter this gives INSUFFICIENT DATA, never SAFE.
+  required parameter this gives CAUTION, never SAFE.
 - **Saved runs are per browser and address** (IndexedDB), not a shared database.
 - **Lint:** `npm run lint` reported ~790 Prettier formatting errors in the original
   code before this migration. New files are formatted; old files were left as they
@@ -428,7 +435,62 @@ npm registry. Neither is used at runtime.
 
 ## 10. Test results
 
-### Mining safety update (latest)
+### Safety thresholds update (latest)
+
+Tested in the same Linux container with Ollama 0.40.11 and `qwen2.5:1.5b`.
+All readings were **synthetic** (`scripts/make-sample-sensor-csv.mjs` and test
+fixtures); the site CO limit used in tests is a fixture, not a real limit.
+
+**Passed**
+
+- `tsc --noEmit`, `npm run build`, `npm run build:pages`.
+- `npm test`: 157 unit tests in 10 files, including:
+  - `safety.test.ts` (36): built-in config loads real rules (5 checked by
+    default); no site file → CAUTION; every enabled rule at its boundaries
+    (CH4 0.8 / 0.81 / 1.25 / 1.26 %vol, O2 19 / 18.99, CO2 0.5 / 0.51, site CO
+    25 / 26 / 51 ppm); flame and smoke detections (1, "yes", unreadable);
+    stale data → CAUTION, stale + critical → UNSAFE; unsorted rows; configured
+    stale timeout and sampling interval; no time column; future timestamps;
+    missing latest value, missing column, out-of-range value, conflicting
+    duplicate timestamps, empty data, a sensor gone stale; disabled and
+    unverified rules shown as NOT CHECKED; provisional critical → CAUTION only;
+    degree-of-gassiness rules; ppm and m/min rules applied to %vol and m/s
+    fields; Graham's ratio cross-check, fraction-vs-percent detection, the
+    ΔO2 < 0.3 guard, steady increase; only SAFE/CAUTION/UNSAFE ever returned.
+  - `config.test.ts` (37): the shipped JSON is valid and covers all 18
+    fields; enabled rules are verified with sources; unverified thresholds
+    are null and disabled; provisional rules ship disabled; merge and replace
+    imports; 21 kinds of invalid file each rejected with its reason; unit
+    conversions; CIMFR Table 2 (12 Sep) reproduced (Graham 8.0475,
+    Trickett 0.97455); saved file applied, persisted, exported, cleared; an
+    invalid file never replaces the active rules.
+  - `ai-safety.test.ts` (21): the prompt carries thresholds, verification
+    status, clauses, newest timestamp, data-quality warnings and unverified
+    required rules; the model cannot change the status; misattributed
+    breaches are flagged; no assessment → CAUTION.
+- Synthetic scenarios with the built-in rules / with a site CO rule: normal →
+  CAUTION / SAFE; methane → UNSAFE; low oxygen → UNSAFE; smoke → UNSAFE;
+  stale → CAUTION; heating → CAUTION.
+- Browser end-to-end (Chromium, production build, real local model): built-in
+  rules shown with a non-zero count; no INSUFFICIENT text; invalid site file
+  rejected in the preview with no APPLY button and rules unchanged; valid
+  file previewed (merge, 1 replaced) then applied → SAFE; kept after reload;
+  methane → UNSAFE with the clause, AI explanation and exported report
+  agreeing; low oxygen and smoke → UNSAFE; stale → CAUTION with STALE and
+  PREVENTS SAFE; removing the site file → CAUTION; no request left 127.0.0.1
+  (25 checks). In one run the model wrote "CO2 exceeded critical limits" when
+  only methane had; the misattribution check was added for that.
+- The same browser test on the GitHub Pages build, served under
+  `/Local_Mining_LLM/`, without AI: all 23 non-AI checks passed (the safety
+  status, import, preview and persistence run entirely in the browser).
+
+**Not verified**
+
+- The official DGMS copy of CMR 2017 and any amendments (site unreachable).
+- Real mine data or a real site thresholds file.
+- Windows, and browsers other than Chromium.
+
+### Mining safety update
 
 Tested in the same Linux container with Ollama 0.40.11 and `qwen2.5:1.5b`.
 
@@ -444,7 +506,7 @@ Tested in the same Linux container with Ollama 0.40.11 and `qwen2.5:1.5b`.
   preflight, Host check, JSON-only, size limit).
 - `npm run build` and `npm run build:pages` (relative `./assets/` paths for the
   `/Local_Mining_LLM/` sub-path; no server code in the Pages bundle).
-- Local app in Chromium with real Ollama: demo data gives INSUFFICIENT DATA before
+- Local app in Chromium with real Ollama: demo data gives INSUFFICIENT DATA (a status since removed) before
   any AI runs, with 1-hour MA labels and no "7-DAY" text left. After loading a
   test thresholds file (fixture values, not real limits), a CSV with a critical
   reading gives UNSAFE, with the measurement table, AI explanation and exported
@@ -505,6 +567,27 @@ Ollama library).
 - Real mine-site data, and judging whether the model's explanations are useful.
 
 ## 11. Files changed
+
+### Safety thresholds update
+
+Added: `src/config/safety-rules.json` (replaces `src/config/safety-rules.ts`),
+`src/lib/safety/config.ts` (schema, validation, merge),
+`src/lib/safety/units.ts`, `src/lib/safety/derived.ts` (Graham's and
+Trickett ratios), `src/lib/safety/format.ts`, `docs/safety-sources.md`,
+`docs/site-thresholds.md`, `scripts/make-sample-sensor-csv.mjs`, tests
+`config` and `fixtures`.
+
+Rewritten: `src/lib/safety/assess.ts` (three statuses, freshness, data
+quality), `src/lib/safety/store.ts`, `src/components/safety-panel.tsx`
+(import preview, rule table, freshness). Removed: `src/lib/safety/rules.ts`.
+
+Changed: `src/lib/ai/prompts.ts` and `src/lib/ai/insights.ts` (new facts,
+misattribution check), `src/lib/ai/analyst.ts`, `src/lib/dataset.ts` (shared
+timestamp parser, units for `%vol`, `m/s`, `kPa`; unreadable text in a numeric
+column is kept so it can be flagged), `src/lib/report.ts`,
+`src/routes/index.tsx`, `src/components/charts.tsx`, `tsconfig.json`
+(`resolveJsonModule`), tests `safety`, `ai-safety`, `analysis`,
+`browser-client`.
 
 ### Mining safety update
 

@@ -1,291 +1,554 @@
 // @vitest-environment node
+// All measurements and site thresholds below are SYNTHETIC test fixtures.
 import { describe, expect, it } from "vitest";
 
-import { buildDataset, buildDemoDataset } from "@/lib/dataset";
-import { assessSafety } from "@/lib/safety/assess";
+import { buildDataset } from "@/lib/dataset";
 import {
-  parseRulesFile,
-  safetyRuleSchema,
-  type SafetyRule,
-} from "@/lib/safety/rules";
+  SAFETY_STATUSES,
+  assessSafety,
+  type SafetyStatus,
+} from "@/lib/safety/assess";
+import { builtinConfig } from "@/lib/safety/config";
+import { formatThreshold } from "@/lib/safety/format";
+import {
+  NOW,
+  TEST_VERIFICATION,
+  sensorData,
+  siteFile,
+  withSite,
+} from "./fixtures";
 
-// Test-only thresholds. These numbers are fixtures, not real safety limits.
-const rule = (over: Partial<SafetyRule> = {}): SafetyRule =>
-  safetyRuleSchema.parse({
-    id: "gas",
-    label: "Test gas",
-    columns: ["gas_pct"],
-    unit: "%",
-    direction: "above",
-    warning: 1,
-    critical: 2,
-    source: "test fixture",
-    required: true,
-    ...over,
-  });
+const base = builtinConfig();
+const verifiedCo = withSite(siteFile());
+const assess = (ds = sensorData(), cfg = verifiedCo, now = NOW) =>
+  assessSafety(ds, cfg, { now });
+type Edit = NonNullable<NonNullable<Parameters<typeof sensorData>[0]>["edit"]>;
+const latest = (edit: Edit) =>
+  sensorData({ edit: (i) => (i === 9 ? edit(i) : {}) });
+const ev = (a: ReturnType<typeof assess>, id: string) =>
+  a.evaluations.find((e) => e.ruleId === id)!;
+/** A dataset with headers but no rows (buildDataset itself rejects such files). */
+const emptyData = () => ({ ...sensorData({ n: 1 }), rows: [], rowCount: 0 });
+/** Gas readings with a reliable oxygen deficiency (ΔO2 ≈ 1.67 %), so Graham's ratio is meaningful. */
+const HEATING = { O2_vol_pct: 19.5, CO2_vol_pct: 0.4, CO_ppm: 40 };
 
-const NOW = Date.parse("2026-10-01T09:00:00");
-const csv = (rows: string[]) =>
-  buildDataset(["time,gas_pct,flow_m3s", ...rows].join("\n"), "t.csv");
-// Seven readings from 08:00 to 09:00, the last hour before NOW.
-const hour = (gas: (i: number) => string | number) =>
-  csv([
-    ...Array.from(
-      { length: 6 },
-      (_, i) => `2026-10-01 08:${String(i * 10).padStart(2, "0")},${gas(i)},40`,
-    ),
-    `2026-10-01 09:00,${gas(6)},40`,
-  ]);
-
-describe("deterministic safety classification", () => {
-  it("returns INSUFFICIENT_DATA when no thresholds are configured (never SAFE by default)", () => {
-    const a = assessSafety(buildDemoDataset(), [], { now: NOW });
-    expect(a.status).toBe("INSUFFICIENT_DATA");
-    expect(a.reasons[0]).toMatch(/No verified safety thresholds/);
-  });
-
-  it("is SAFE only when every configured check passes on current, complete data", () => {
-    const a = assessSafety(
-      hour(() => 0.5),
-      [rule()],
-      { now: NOW },
+describe("built-in configuration (no site file imported)", () => {
+  it("loads real rules, not zero", () => {
+    expect(base.rules.length).toBeGreaterThanOrEqual(20);
+    const enabledVerified = base.rules.filter(
+      (r) => r.enabled && r.verificationStatus === "verified_regulatory",
     );
+    expect(enabledVerified.map((r) => r.id)).toEqual(
+      expect.arrayContaining([
+        "cmr153-ch4-any-place",
+        "cmr153-o2-min",
+        "cmr153-co2-max",
+        "cmr138-flame-detected",
+        "cmr138-smoke-detected",
+      ]),
+    );
+    const a = assessSafety(sensorData(), base, { now: NOW });
+    expect(a.rulesSummary.enabled).toBeGreaterThan(0);
+    expect(a.rulesSummary.evaluated).toBe(5);
+  });
+
+  it("carries the verified CMR 2017 numbers and sources", () => {
+    const r = (id: string) => base.rules.find((x) => x.id === id)!;
+    expect(r("cmr153-ch4-any-place")).toMatchObject({
+      operator: "greater_than",
+      warningThreshold: 0.8,
+      criticalThreshold: 1.25,
+    });
+    expect(r("cmr153-o2-min")).toMatchObject({
+      operator: "less_than",
+      criticalThreshold: 19,
+    });
+    expect(r("cmr153-co2-max")).toMatchObject({
+      operator: "greater_than",
+      criticalThreshold: 0.5,
+    });
+    expect(r("cmr153-ch4-any-place").source.clause).toMatch(
+      /Reg\. 153\(2\)\(c\)/,
+    );
+    expect(r("cmr153-o2-min").source.verification?.officialCopyChecked).toBe(
+      false,
+    );
+  });
+
+  it("is never SAFE without a verified CO threshold (CMR 2017 has none)", () => {
+    const a = assessSafety(sensorData(), base, { now: NOW });
+    expect(a.status).toBe("CAUTION");
+    expect(a.unverifiedRequired).toContain("co-site-limit");
+    expect(a.reasons.join(" ")).toMatch(/co-site-limit/);
+  });
+});
+
+describe("three statuses only", () => {
+  it("SAFE when every required verified check passes on current data", () => {
+    const a = assess();
     expect(a.status).toBe("SAFE");
     expect(a.reasons.join(" ")).toMatch(/not a certification/);
-    expect(a.evaluations[0]).toMatchObject({
-      level: "ok",
-      latestValue: 0.5,
-      worstValue: 0.5,
-    });
-    expect(a.unassessedParameters).toEqual(["flow_m3s"]);
   });
 
-  it("is UNSAFE when a reading in the current window breaches the critical limit", () => {
-    const a = assessSafety(
-      hour((i) => (i === 3 ? 2.4 : 0.5)),
-      [rule()],
-      { now: NOW },
-    );
-    expect(a.status).toBe("UNSAFE");
-    expect(a.evaluations[0]).toMatchObject({
-      level: "critical",
-      worstValue: 2.4,
-      worstAt: "2026-10-01 08:30",
-    });
-    expect(a.reasons[0]).toMatch(/breaches the critical limit .*test fixture/);
+  it("never returns anything but SAFE, CAUTION or UNSAFE", () => {
+    const scenarios = [
+      assess(),
+      assess(latest(() => ({ CH4_vol_pct: 2 }))),
+      assess(sensorData(), base),
+      assess(emptyData()),
+      assess(buildDataset("a,b\n1,2", "x.csv")),
+      assess(sensorData({ endMinutesBeforeNow: 600 })),
+    ];
+    for (const s of scenarios)
+      expect(SAFETY_STATUSES).toContain(s.status as SafetyStatus);
+    expect(SAFETY_STATUSES).toEqual(["SAFE", "CAUTION", "UNSAFE"]);
+  });
+});
+
+describe("methane — Reg. 153(2)(c) and 169(1)(c)(i)", () => {
+  it("UNSAFE above 1.25 %vol, not at exactly 1.25", () => {
+    expect(assess(latest(() => ({ CH4_vol_pct: 1.26 }))).status).toBe("UNSAFE");
+    const at = assess(latest(() => ({ CH4_vol_pct: 1.25 })));
+    expect(ev(at, "cmr153-ch4-any-place").result).toBe("warning");
+    expect(at.status).toBe("CAUTION");
   });
 
-  it("supports 'below' rules (lower is worse)", () => {
-    const low = rule({
-      id: "o2",
-      direction: "below",
-      warning: 19.5,
-      critical: 19,
-    });
+  it("CAUTION above the 0.8 % warning, OK at exactly 0.8", () => {
     expect(
-      assessSafety(
-        hour(() => 18.9),
-        [low],
-        { now: NOW },
+      ev(assess(latest(() => ({ CH4_vol_pct: 0.81 }))), "cmr153-ch4-any-place")
+        .result,
+    ).toBe("warning");
+    expect(
+      ev(assess(latest(() => ({ CH4_vol_pct: 0.8 }))), "cmr153-ch4-any-place")
+        .result,
+    ).toBe("ok");
+  });
+
+  it("cites the regulation that was triggered", () => {
+    const a = assess(latest(() => ({ CH4_vol_pct: 1.5 })));
+    expect(a.triggeredRuleIds).toContain("cmr153-ch4-any-place");
+    expect(a.reasons[0]).toMatch(/Reg\. 153\(2\)\(c\)/);
+  });
+});
+
+describe("oxygen and carbon dioxide — Reg. 153(2)(b)", () => {
+  it("O2 below 19 % is UNSAFE; exactly 19 % passes", () => {
+    expect(assess(latest(() => ({ O2_vol_pct: 18.99 }))).status).toBe("UNSAFE");
+    expect(
+      ev(assess(latest(() => ({ O2_vol_pct: 19 }))), "cmr153-o2-min").result,
+    ).toBe("ok");
+  });
+
+  it("CO2 above 0.5 % is UNSAFE; exactly 0.5 % passes", () => {
+    expect(assess(latest(() => ({ CO2_vol_pct: 0.51 }))).status).toBe("UNSAFE");
+    expect(
+      ev(assess(latest(() => ({ CO2_vol_pct: 0.5 }))), "cmr153-co2-max").result,
+    ).toBe("ok");
+  });
+});
+
+describe("carbon monoxide (site rule from a site file)", () => {
+  it("applies warning and critical boundaries from the site file", () => {
+    expect(
+      ev(assess(latest(() => ({ CO_ppm: 26 }))), "co-site-limit").result,
+    ).toBe("warning");
+    expect(
+      ev(assess(latest(() => ({ CO_ppm: 25 }))), "co-site-limit").result,
+    ).toBe("ok");
+    expect(assess(latest(() => ({ CO_ppm: 51 }))).status).toBe("UNSAFE");
+  });
+});
+
+describe("vision detections — Reg. 138(1)", () => {
+  it("a positive flame or smoke detection is UNSAFE", () => {
+    expect(assess(latest(() => ({ YOLO_Flame_Detected: 1 }))).status).toBe(
+      "UNSAFE",
+    );
+    const smoke = assess(latest(() => ({ YOLO_Smoke_Detected: "yes" })));
+    expect(smoke.status).toBe("UNSAFE");
+    expect(smoke.nextActions.join(" ")).toMatch(/possible fire/);
+  });
+
+  it("accepts true/false words and flags unreadable detections", () => {
+    const words = buildDataset(
+      [
+        "Timestamp,CO_ppm,CH4_vol_pct,O2_vol_pct,CO2_vol_pct,YOLO_Flame_Detected",
+        `${new Date(NOW - 60_000).toISOString()},5,0.2,20.8,0.08,maybe`,
+      ].join("\n"),
+      "w.csv",
+    );
+    const a = assess(words);
+    expect(
+      a.dataQuality.some(
+        (q) =>
+          q.code === "invalid_values" && q.parameter === "YOLO_Flame_Detected",
+      ),
+    ).toBe(true);
+    expect(a.status).toBe("CAUTION");
+  });
+
+  it("a negative detection is not proof of safety: it only means the rule passed", () => {
+    const a = assess();
+    expect(ev(a, "cmr138-flame-detected").result).toBe("ok");
+    expect(ev(a, "cmr138-flame-detected").explanation).not.toMatch(/no fire/i);
+  });
+});
+
+describe("timestamps and freshness", () => {
+  it("stale data is CAUTION with a clear warning", () => {
+    const a = assess(sensorData({ endMinutesBeforeNow: 16 }));
+    expect(a.status).toBe("CAUTION");
+    expect(a.isStale).toBe(true);
+    expect(a.dataQuality.find((q) => q.code === "stale_data")!.message).toMatch(
+      /16 min old/,
+    );
+  });
+
+  it("a critical reading still gives UNSAFE on stale data", () => {
+    expect(
+      assess(
+        sensorData({
+          endMinutesBeforeNow: 600,
+          edit: (i) => (i === 9 ? { CH4_vol_pct: 2 } : {}),
+        }),
       ).status,
     ).toBe("UNSAFE");
-    expect(
-      assessSafety(
-        hour(() => 19.4),
-        [low],
-        { now: NOW },
-      ).status,
-    ).toBe("CAUTION");
-    expect(
-      assessSafety(
-        hour(() => 20.9),
-        [low],
-        { now: NOW },
-      ).status,
-    ).toBe("SAFE");
   });
 
-  it("is CAUTION for a warning-level reading", () => {
-    const a = assessSafety(
-      hour((i) => (i === 6 ? 1.2 : 0.5)),
-      [rule()],
-      { now: NOW },
+  it("sorts unsorted rows and reports the newest valid timestamp", () => {
+    const t = (m: number) => new Date(NOW - m * 60_000).toISOString();
+    const csv = [
+      "Timestamp,CO_ppm,CH4_vol_pct,O2_vol_pct,CO2_vol_pct",
+      `${t(1)},5,0.2,20.8,0.08`,
+      `${t(3)},5,0.2,20.8,0.08`,
+      `${t(2)},5,0.2,20.8,0.08`,
+    ].join("\n");
+    const a = assess(buildDataset(csv, "u.csv"));
+    expect(a.latestTimestampIso).toBe(t(1));
+    expect(a.samplingIntervalSeconds).toBe(60);
+  });
+
+  it("uses the configured stale timeout and expected sampling interval", () => {
+    const cfg = withSite(
+      siteFile({
+        dataQuality: {
+          staleAfterMinutes: 30,
+          expectedSamplingIntervalSeconds: 10,
+        },
+      }),
+    );
+    const a = assessSafety(sensorData({ endMinutesBeforeNow: 20 }), cfg, {
+      now: NOW,
+    });
+    expect(a.isStale).toBe(false);
+    expect(a.dataQuality.some((q) => q.code === "sampling_interval")).toBe(
+      true,
     );
     expect(a.status).toBe("CAUTION");
   });
 
-  it("puts UNSAFE ahead of INSUFFICIENT_DATA (critical wins even on old data)", () => {
-    const a = assessSafety(
-      hour(() => 3),
-      [rule()],
-      { now: NOW + 24 * 3600_000 },
+  it("without a time column the data cannot be confirmed current", () => {
+    const a = assess(
+      buildDataset(
+        "CO_ppm,CH4_vol_pct,O2_vol_pct,CO2_vol_pct\n5,0.2,20.8,0.08",
+        "nt.csv",
+      ),
     );
-    expect(a.status).toBe("UNSAFE");
+    expect(a.status).toBe("CAUTION");
+    expect(a.dataQuality[0]!.code).toBe("no_time_column");
+  });
+
+  it("flags timestamps in the future", () => {
     expect(
-      a.reasons.some((r) => /does not describe current conditions/.test(r)),
+      assess(sensorData({ endMinutesBeforeNow: -30 })).dataQuality.some(
+        (q) => q.code === "future_timestamps",
+      ),
     ).toBe(true);
-  });
-
-  it("does not return SAFE for data that is not current", () => {
-    const a = assessSafety(
-      hour(() => 0.5),
-      [rule()],
-      { now: NOW + 3 * 3600_000 },
-    );
-    expect(a.status).toBe("INSUFFICIENT_DATA");
-  });
-
-  it("does not return SAFE when a required parameter is missing", () => {
-    const a = assessSafety(
-      hour(() => 0.5),
-      [rule(), rule({ id: "co", label: "CO", columns: ["co_ppm"] })],
-      {
-        now: NOW,
-      },
-    );
-    expect(a.status).toBe("INSUFFICIENT_DATA");
-    expect(a.reasons.join(" ")).toMatch(/Required parameter "CO"/);
-  });
-
-  it("does not return SAFE when readings are missing or invalid in the current window", () => {
-    const missing = assessSafety(
-      hour(() => ""),
-      [rule()],
-      { now: NOW },
-    );
-    expect(missing.status).toBe("INSUFFICIENT_DATA");
-    const invalid = assessSafety(
-      hour(() => 150),
-      [rule({ validRange: [0, 100] })],
-      { now: NOW },
-    );
-    expect(invalid.status).toBe("INSUFFICIENT_DATA");
-    expect(invalid.evaluations[0]!.level).toBe("invalid");
-  });
-
-  it("does not return SAFE when a sensor is stale", () => {
-    const ds = csv([
-      "2026-10-01 07:00,0.5,40",
-      "2026-10-01 08:50,,40",
-      "2026-10-01 09:00,,40",
-    ]);
-    const a = assessSafety(ds, [rule({ maxStalenessMinutes: 15 })], {
-      now: NOW,
-    });
-    expect(a.status).toBe("INSUFFICIENT_DATA");
-  });
-
-  it("flags conflicting readings at the same timestamp", () => {
-    const ds = csv([
-      "2026-10-01 08:50,0.5,40",
-      "2026-10-01 09:00,0.4,40",
-      "2026-10-01 09:00,0.9,40",
-    ]);
-    const a = assessSafety(ds, [rule()], { now: NOW });
-    expect(a.status).toBe("INSUFFICIENT_DATA");
-    expect(a.dataQualityNotes.join(" ")).toMatch(/same timestamp/);
-  });
-
-  it("uses the worst of several sensors for one rule and notes the disagreement", () => {
-    const ds = buildDataset(
-      [
-        "time,gas_a,gas_b",
-        "2026-10-01 08:30,0.4,2.5",
-        "2026-10-01 09:00,0.5,0.6",
-      ].join("\n"),
-      "two.csv",
-    );
-    const a = assessSafety(ds, [rule({ columns: ["gas_a", "gas_b"] })], {
-      now: NOW,
-    });
-    expect(a.status).toBe("UNSAFE");
-    expect(a.dataQualityNotes.join(" ")).toMatch(/disagree/);
-  });
-
-  it("notes an earlier critical breach outside the current window as CAUTION", () => {
-    const ds = csv([
-      "2026-10-01 06:00,2.5,40",
-      "2026-10-01 08:30,0.5,40",
-      "2026-10-01 09:00,0.5,40",
-    ]);
-    expect(assessSafety(ds, [rule()], { now: NOW }).status).toBe("CAUTION");
-  });
-
-  it("cannot be SAFE without a time column", () => {
-    const ds = buildDataset("gas_pct,flow\n0.5,40\n0.5,41", "nt.csv");
-    expect(assessSafety(ds, [rule()], { now: NOW }).status).toBe(
-      "INSUFFICIENT_DATA",
-    );
-    const bad = buildDataset("gas_pct,flow\n0.5,40\n2.5,41", "nt2.csv");
-    expect(assessSafety(bad, [rule()], { now: NOW }).status).toBe("UNSAFE");
-  });
-
-  it("reports the 1-hour moving average next to the latest reading", () => {
-    const a = assessSafety(
-      hour((i) => i * 0.1),
-      [rule()],
-      { now: NOW },
-    );
-    expect(a.evaluations[0]!.latestValue).toBeCloseTo(0.6);
-    // window (08:00, 09:00] → 08:10..09:00 = 0.1..0.6 → mean 0.35
-    expect(a.evaluations[0]!.movingAvg1h).toBeCloseTo(0.35, 10);
   });
 });
 
-describe("thresholds file", () => {
-  it("accepts a valid file and rejects bad ordering or missing sources", () => {
-    const good = parseRulesFile(
-      JSON.stringify({
-        version: 1,
-        rules: [
-          {
-            id: "x",
-            label: "X",
-            columns: ["x"],
-            unit: "",
-            direction: "above",
-            warning: 1,
-            critical: 2,
-            source: "site std 4.2",
-          },
-        ],
-      }),
+describe("missing, invalid, conflicting and empty data", () => {
+  it("a missing reading is never treated as normal", () => {
+    const a = assess(latest(() => ({ O2_vol_pct: "" })));
+    expect(a.status).toBe("CAUTION");
+    expect(
+      a.dataQuality.some(
+        (q) => q.code === "missing_latest" && q.parameter === "O2_vol_pct",
+      ),
+    ).toBe(true);
+  });
+
+  it("a required parameter absent from the data blocks SAFE", () => {
+    const ds = buildDataset(
+      [
+        "Timestamp,CO_ppm,CH4_vol_pct,CO2_vol_pct",
+        `${new Date(NOW - 60_000).toISOString()},5,0.2,0.08`,
+      ].join("\n"),
+      "no-o2.csv",
     );
-    expect(good.ok).toBe(true);
-    const bad = parseRulesFile(
-      JSON.stringify({
-        version: 1,
-        rules: [
-          {
-            id: "x",
-            label: "X",
-            columns: ["x"],
-            unit: "",
-            direction: "above",
-            warning: 3,
-            critical: 2,
-            source: "s s s",
-          },
-        ],
-      }),
+    const a = assess(ds);
+    expect(a.status).toBe("CAUTION");
+    expect(ev(a, "cmr153-o2-min").notEvaluatedReason).toMatch(
+      /not in this data/,
     );
-    expect(bad.ok).toBe(false);
-    expect(parseRulesFile("{nope").ok).toBe(false);
-    const noSource = parseRulesFile(
-      JSON.stringify({
-        version: 1,
-        rules: [
-          {
-            id: "x",
-            label: "X",
-            columns: ["x"],
-            unit: "",
-            direction: "above",
-            critical: 2,
-          },
-        ],
-      }),
+  });
+
+  it("out-of-range and non-numeric readings are invalid, not used", () => {
+    const a = assess(latest(() => ({ O2_vol_pct: 150 })));
+    expect(
+      a.dataQuality.some(
+        (q) => q.code === "invalid_values" && q.parameter === "O2_vol_pct",
+      ),
+    ).toBe(true);
+    expect(a.status).toBe("CAUTION");
+  });
+
+  it("different values at the same timestamp are conflicting", () => {
+    const t = new Date(NOW - 60_000).toISOString();
+    const ds = buildDataset(
+      [
+        "Timestamp,CO_ppm,CH4_vol_pct,O2_vol_pct,CO2_vol_pct",
+        `${t},5,0.2,20.8,0.08`,
+        `${t},5,0.3,20.8,0.08`,
+      ].join("\n"),
+      "c.csv",
     );
-    expect(noSource.ok).toBe(false);
+    const a = assess(ds);
+    expect(
+      a.dataQuality.some(
+        (q) => q.code === "conflict" && q.parameter === "CH4_vol_pct",
+      ),
+    ).toBe(true);
+    expect(a.status).toBe("CAUTION");
+  });
+
+  it("an empty dataset is CAUTION", () => {
+    const a = assess(emptyData());
+    expect(a.status).toBe("CAUTION");
+    expect(a.dataQuality[0]!.code).toBe("empty");
+  });
+
+  it("a stale sensor inside fresh data is flagged", () => {
+    const a = assess(
+      sensorData({ n: 30, edit: (i) => (i > 5 ? { CH4_vol_pct: "" } : {}) }),
+    );
+    expect(
+      a.dataQuality.some(
+        (q) => q.code === "stale_parameter" && q.parameter === "CH4_vol_pct",
+      ),
+    ).toBe(true);
+    expect(a.status).toBe("CAUTION");
+  });
+});
+
+describe("unverified and provisional rules", () => {
+  it("disabled and unverified rules are reported as not checked, never as passed", () => {
+    const a = assess();
+    for (const id of [
+      "cimfr-grahams-ratio",
+      "h2-monitoring",
+      "cmr153-wet-bulb",
+      "cmr160-velocity-outbye-connection",
+    ]) {
+      expect(ev(a, id).result).toBe("not_evaluated");
+      expect(ev(a, id).notEvaluatedReason).toBeTruthy();
+    }
+    expect(ev(a, "h2-monitoring").notEvaluatedReason).toMatch(
+      /requires verification/,
+    );
+  });
+
+  it("a triggered provisional critical rule gives CAUTION, never UNSAFE", () => {
+    const cfg = withSite(
+      siteFile({}, [
+        {
+          ...base.rules.find((r) => r.id === "cimfr-grahams-ratio")!,
+          enabled: true,
+        },
+      ]),
+    );
+    // Gases giving a reliable oxygen deficiency and Graham's ratio ≈ 1.5 %.
+    const ds = sensorData({
+      extraColumns: ["Grahams_Ratio"],
+      edit: () => ({ ...HEATING, Grahams_Ratio: 1.5 }),
+    });
+    const a = assessSafety(ds, cfg, { now: NOW });
+    expect(ev(a, "cimfr-grahams-ratio").result).toBe("critical");
+    expect(ev(a, "cimfr-grahams-ratio").effect).toBe("CAUTION");
+    expect(a.status).not.toBe("UNSAFE");
+  });
+
+  it("Reg. 166 degree-specific methane rules apply only when the degree is set", () => {
+    expect(
+      ev(assess(latest(() => ({ CH4_vol_pct: 0.3 }))), "cmr166-ch4-degree-1")
+        .notEvaluatedReason,
+    ).toMatch(/not set/);
+    const deg1 = withSite(siteFile({ mineContext: { degreeOfGassiness: 1 } }));
+    const a = assessSafety(
+      latest(() => ({ CH4_vol_pct: 0.1 })),
+      deg1,
+      { now: NOW },
+    );
+    expect(ev(a, "cmr166-ch4-degree-1").result).toBe("critical");
+    expect(a.status).toBe("UNSAFE");
+  });
+});
+
+describe("unit conversion inside the engine", () => {
+  it("a site rule written in ppm checks a %vol field", () => {
+    const cfg = withSite(
+      siteFile({}, [
+        {
+          id: "site-ch4-ppm",
+          parameter: "CH4_vol_pct",
+          unit: "ppm",
+          operator: "greater_than_or_equal",
+          warningThreshold: 5000,
+          criticalThreshold: null,
+          severity: "warning",
+          verificationStatus: "verified_site",
+          enabled: true,
+          source: {
+            document: "TEST",
+            clause: "TEST",
+            localReference: "test",
+            verification: TEST_VERIFICATION,
+          },
+          explanation: "Test fixture.",
+        },
+      ]),
+    );
+    const a = assessSafety(
+      latest(() => ({ CH4_vol_pct: 0.5 })),
+      cfg,
+      { now: NOW },
+    );
+    expect(ev(a, "site-ch4-ppm")).toMatchObject({
+      warning: 0.5,
+      unit: "%vol",
+      result: "warning",
+    });
+  });
+
+  it("the Reg. 160 velocity rule (m/min) checks an m/s field when enabled", () => {
+    const vel = {
+      ...base.rules.find((r) => r.id === "cmr160-velocity-outbye-connection")!,
+      enabled: true,
+    };
+    const cfg = withSite(siteFile({}, [vel]));
+    const a = assessSafety(
+      latest(() => ({ Air_Velocity_m_s: 0.4 })),
+      cfg,
+      { now: NOW },
+    );
+    expect(ev(a, "cmr160-velocity-outbye-connection")).toMatchObject({
+      critical: 0.5,
+      result: "critical",
+    });
+    expect(a.status).toBe("UNSAFE");
+    expect(
+      ev(
+        assessSafety(
+          latest(() => ({ Air_Velocity_m_s: 0.5 })),
+          cfg,
+          { now: NOW },
+        ),
+        "cmr160-velocity-outbye-connection",
+      ).result,
+    ).toBe("ok");
+  });
+});
+
+describe("derived indicators", () => {
+  it("flags a supplied Graham's ratio that disagrees with the gas readings", () => {
+    const ds = sensorData({
+      extraColumns: ["Grahams_Ratio", "Trickett_Ratio"],
+      edit: () => ({
+        O2_vol_pct: 19.5,
+        CO2_vol_pct: 0.4,
+        CO_ppm: 40,
+        Grahams_Ratio: 9,
+        Trickett_Ratio: 0.3,
+      }),
+    });
+    const a = assess(ds);
+    expect(
+      a.dataQuality.some(
+        (q) => q.code === "derived_mismatch" && q.parameter === "Grahams_Ratio",
+      ),
+    ).toBe(true);
+    expect(a.status).toBe("CAUTION");
+  });
+
+  it("recognises a Graham's ratio written as a fraction instead of a percentage", () => {
+    // ΔO2 = 0.265 × (100 − 19.5 − 0.4 − 0.2 − 0.004) − 19.5 = 1.6739 → GR = 0.2390 %
+    const ds = sensorData({
+      extraColumns: ["Grahams_Ratio"],
+      edit: () => ({
+        O2_vol_pct: 19.5,
+        CO2_vol_pct: 0.4,
+        CO_ppm: 40,
+        Grahams_Ratio: 0.00239,
+      }),
+    });
+    expect(
+      assess(ds).dataQuality.find((q) => q.code === "derived_mismatch")!
+        .message,
+    ).toMatch(/looks like a fraction/);
+  });
+
+  it("skips Graham's ratio when the oxygen deficiency is too small (fresh air)", () => {
+    const cfg = withSite(
+      siteFile({}, [
+        {
+          ...base.rules.find((r) => r.id === "cimfr-grahams-ratio")!,
+          enabled: true,
+        },
+      ]),
+    );
+    const a = assessSafety(
+      sensorData({
+        extraColumns: ["Grahams_Ratio"],
+        edit: () => ({ Grahams_Ratio: 3 }),
+      }),
+      cfg,
+      { now: NOW },
+    );
+    expect(ev(a, "cimfr-grahams-ratio").notEvaluatedReason).toMatch(
+      /below 0\.3%/,
+    );
+  });
+
+  it("detects a steady increase when that provisional rule is enabled", () => {
+    const rule = {
+      ...base.rules.find((r) => r.id === "cmr137-grahams-steady-increase")!,
+      enabled: true,
+    };
+    const cfg = withSite(siteFile({}, [rule]));
+    const ds = sensorData({
+      extraColumns: ["Grahams_Ratio"],
+      edit: (i) => ({
+        ...HEATING,
+        Grahams_Ratio: i < 6 ? 0.3 : 0.3 + (i - 5) * 0.05,
+      }),
+    });
+    const a = assessSafety(ds, cfg, { now: NOW });
+    expect(ev(a, "cmr137-grahams-steady-increase").result).toBe("warning");
+  });
+});
+
+describe("threshold display", () => {
+  it("shows detections only at the rule's severity level", () => {
+    const a = assess();
+    const flame = ev(a, "cmr138-flame-detected");
+    expect([
+      formatThreshold(flame, "warning"),
+      formatThreshold(flame, "critical"),
+    ]).toEqual(["—", "detected"]);
+    const ch4 = ev(a, "cmr153-ch4-any-place");
+    expect([
+      formatThreshold(ch4, "warning"),
+      formatThreshold(ch4, "critical"),
+    ]).toEqual(["> 0.8 %vol", "> 1.25 %vol"]);
   });
 });

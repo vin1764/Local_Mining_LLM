@@ -1,7 +1,11 @@
 import Papa from "papaparse";
 
 import { movingAverage, parseTimestamp } from "@/lib/moving-average";
-import { compactAssessment, type SafetyAssessment, type SafetyStatus } from "@/lib/safety/assess";
+import {
+  compactAssessment,
+  type SafetyAssessment,
+  type SafetyStatus,
+} from "@/lib/safety/assess";
 
 /* ============================ Types ============================ */
 
@@ -132,7 +136,11 @@ function isMissing(v: unknown): boolean {
 
 function parseNumber(v: unknown): number | null {
   if (isMissing(v)) return null;
-  const n = Number(String(v).trim().replace(/[,\s%$]/g, ""));
+  const n = Number(
+    String(v)
+      .trim()
+      .replace(/[,\s%$]/g, ""),
+  );
   return Number.isFinite(n) ? n : null;
 }
 
@@ -140,14 +148,17 @@ function isTimeLike(v: unknown): boolean {
   if (isMissing(v)) return false;
   const s = String(v).trim();
   if (!/\d/.test(s) || !/[-/:]/.test(s)) return false;
-  return !Number.isNaN(Date.parse(s));
+  return parseTimestamp(s) !== null;
 }
 
 export function inferUnit(name: string): string {
   const n = name.toLowerCase();
+  if (/vol_?pct|vol_?percent/.test(n)) return "%vol";
   if (/pct|percent|%/.test(n)) return "%";
   if (/ppm/.test(n)) return "ppm";
   if (/m3_?s|m³\/s|cumecs/.test(n)) return "m³/s";
+  if (/(^|_)m_s$|m_per_s/.test(n)) return "m/s";
+  if (/(^|_)kpa$/.test(n)) return "kPa";
   if (/(^|_)(kwh|energy)/.test(n)) return "kWh";
   if (/tph|tonn/.test(n)) return "t/h";
   if (/(^|_)kl|water/.test(n)) return "kL";
@@ -213,7 +224,9 @@ export function buildDataset(text: string, name: string): Dataset {
       if (isMissing(v)) {
         row[col] = null;
       } else if (types.get(col) === "number") {
-        row[col] = parseNumber(v);
+        // Keep unreadable text (e.g. "yes" in a 0/1 detection column) instead
+        // of dropping it, so the safety checks can read or flag it.
+        row[col] = parseNumber(v) ?? String(v).trim();
       } else {
         row[col] = String(v).trim();
       }
@@ -225,7 +238,7 @@ export function buildDataset(text: string, name: string): Dataset {
   // timeline even when the CSV is not in order. Unparseable times go last.
   if (timeColumn) {
     const t = (r: Record<string, number | string | null>) => {
-      const ms = Date.parse(String(r[timeColumn] ?? ""));
+      const ms = parseTimestamp(r[timeColumn]) ?? Number.NaN;
       return Number.isNaN(ms) ? Number.POSITIVE_INFINITY : ms;
     };
     rows.sort((a, b) => {
@@ -243,7 +256,11 @@ export function buildDataset(text: string, name: string): Dataset {
     if (type === "number") numericNames.push(col);
     if (type === "category") categoryNames.push(col);
 
-    const meta: ColumnMeta = { name: col, type, unit: type === "number" ? inferUnit(col) : "" };
+    const meta: ColumnMeta = {
+      name: col,
+      type,
+      unit: type === "number" ? inferUnit(col) : "",
+    };
 
     if (type === "number") {
       meta.stats = computeStats(rows, col);
@@ -265,7 +282,10 @@ export function buildDataset(text: string, name: string): Dataset {
 
 /* ============================ Statistics ============================ */
 
-export function computeStats(rows: Record<string, number | string | null>[], col: string): NumberStats {
+export function computeStats(
+  rows: Record<string, number | string | null>[],
+  col: string,
+): NumberStats {
   const values: number[] = [];
   let missing = 0;
   for (const row of rows) {
@@ -289,9 +309,11 @@ export function computeStats(rows: Record<string, number | string | null>[], col
   const tail = values.slice(-q);
   const headMean = head.reduce((a, b) => a + b, 0) / (head.length || 1);
   const tailMean = tail.reduce((a, b) => a + b, 0) / (tail.length || 1);
-  const trendPct = headMean !== 0 ? ((tailMean - headMean) / Math.abs(headMean)) * 100 : 0;
+  const trendPct =
+    headMean !== 0 ? ((tailMean - headMean) / Math.abs(headMean)) * 100 : 0;
 
-  const anomalyCount = std > 0 ? values.filter((v) => Math.abs((v - mean) / std) >= 3).length : 0;
+  const anomalyCount =
+    std > 0 ? values.filter((v) => Math.abs((v - mean) / std) >= 3).length : 0;
 
   return {
     min,
@@ -319,7 +341,9 @@ export function computeAnomalies(dataset: Dataset, limit = 14): Anomaly[] {
         out.push({
           column: col,
           rowIndex: i,
-          label: dataset.timeColumn ? String(row[dataset.timeColumn] ?? `#${i}`) : `#${i}`,
+          label: dataset.timeColumn
+            ? String(row[dataset.timeColumn] ?? `#${i}`)
+            : `#${i}`,
           value: v,
           z: Number(z.toFixed(2)),
         });
@@ -349,7 +373,10 @@ function pearson(xs: number[], ys: number[]): number {
   return cov / Math.sqrt(vx * vy);
 }
 
-export function computeCorrelations(dataset: Dataset, maxPairs = 8): Correlation[] {
+export function computeCorrelations(
+  dataset: Dataset,
+  maxPairs = 8,
+): Correlation[] {
   const pairs: Correlation[] = [];
   for (let i = 0; i < dataset.numericNames.length; i++) {
     for (let j = i + 1; j < dataset.numericNames.length; j++) {
@@ -381,13 +408,16 @@ export function chartOrderedRows(dataset: Dataset): Dataset["rows"] {
   const tc = dataset.timeColumn;
   if (!tc) return dataset.rows;
   return [...dataset.rows].sort((a, b) => {
-    const ta = Date.parse(String(a[tc] ?? ""));
-    const tb = Date.parse(String(b[tc] ?? ""));
+    const ta = parseTimestamp(a[tc]) ?? Number.NaN;
+    const tb = parseTimestamp(b[tc]) ?? Number.NaN;
     return (Number.isNaN(ta) ? 0 : ta) - (Number.isNaN(tb) ? 0 : tb);
   });
 }
 
-export function buildChartRows(dataset: Dataset, selected: string[]): ChartRow[] {
+export function buildChartRows(
+  dataset: Dataset,
+  selected: string[],
+): ChartRow[] {
   const ordered = chartOrderedRows(dataset);
   const tc = dataset.timeColumn;
 
@@ -395,7 +425,7 @@ export function buildChartRows(dataset: Dataset, selected: string[]): ChartRow[]
     const out: ChartRow = {
       idx,
       label: tc ? String(row[tc] ?? `#${idx}`) : `#${idx}`,
-      ts: tc ? Date.parse(String(row[tc] ?? "")) || idx : idx,
+      ts: tc ? (parseTimestamp(row[tc]) ?? idx) : idx,
     };
     for (const col of selected) {
       const v = row[col];
@@ -417,23 +447,32 @@ export function formatValue(v: number, unit = ""): string {
 }
 
 export function shortLabel(label: string): string {
-  const t = Date.parse(label);
+  const t = parseTimestamp(label) ?? Number.NaN;
   if (!Number.isNaN(t) && /[-/:]/.test(label)) {
-    return new Date(t).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+    return new Date(t).toLocaleDateString(undefined, {
+      month: "short",
+      day: "numeric",
+    });
   }
   return label;
 }
 
 /* ============================ AI profile ============================ */
 
-export function buildProfile(dataset: Dataset, safety?: SafetyAssessment): DatasetProfile {
+export function buildProfile(
+  dataset: Dataset,
+  safety?: SafetyAssessment,
+): DatasetProfile {
   const tcm = dataset.timeColumn;
   const times = tcm ? dataset.rows.map((r) => parseTimestamp(r[tcm])) : null;
   const columns: ProfileColumn[] = dataset.columns.map((c) => {
     const base: ProfileColumn = { name: c.name, type: c.type, unit: c.unit };
     if (c.type === "category") {
       base.distinct = new Set(
-        dataset.rows.slice(0, 500).map((r) => String(r[c.name] ?? "")).filter(Boolean),
+        dataset.rows
+          .slice(0, 500)
+          .map((r) => String(r[c.name] ?? ""))
+          .filter(Boolean),
       ).size;
     }
     if (c.stats) {
@@ -451,19 +490,28 @@ export function buildProfile(dataset: Dataset, safety?: SafetyAssessment): Datas
       if (std > 0) {
         for (const r of dataset.rows) {
           const v = r[c.name];
-          if (typeof v === "number") maxAbsZ = Math.max(maxAbsZ, Math.abs((v - mean) / std));
+          if (typeof v === "number")
+            maxAbsZ = Math.max(maxAbsZ, Math.abs((v - mean) / std));
         }
       }
       base.maxAbsZ = Number(maxAbsZ.toFixed(2));
       if (times) {
         const series = dataset.rows.map((r, i) => {
           const v = r[c.name];
-          return { t: times[i] ?? null, value: typeof v === "number" ? v : null };
+          return {
+            t: times[i] ?? null,
+            value: typeof v === "number" ? v : null,
+          };
         });
         const ma = movingAverage(series);
         let latest = -1;
         series.forEach((p, i) => {
-          if (p.value !== null && p.t !== null && (latest === -1 || p.t >= series[latest]!.t!)) latest = i;
+          if (
+            p.value !== null &&
+            p.t !== null &&
+            (latest === -1 || p.t >= series[latest]!.t!)
+          )
+            latest = i;
         });
         const point = latest >= 0 ? ma[latest] : undefined;
         if (point && point.avg !== null) {
@@ -476,18 +524,24 @@ export function buildProfile(dataset: Dataset, safety?: SafetyAssessment): Datas
   });
 
   const toLine = (row: Record<string, number | string | null>) =>
-    dataset.columns.map((c) => {
-      const v = row[c.name];
-      return `${c.name}=${v === null ? "∅" : v}`;
-    }).join(" | ").slice(0, 1000);
+    dataset.columns
+      .map((c) => {
+        const v = row[c.name];
+        return `${c.name}=${v === null ? "∅" : v}`;
+      })
+      .join(" | ")
+      .slice(0, 1000);
 
   let timeRange: DatasetProfile["timeRange"] = null;
   const tc = dataset.timeColumn;
   if (tc) {
     const labels = dataset.rows
       .map((r) => r[tc])
-      .filter((v): v is string => typeof v === "string" && !Number.isNaN(Date.parse(v)));
-    if (labels.length > 0) timeRange = { start: labels[0]!, end: labels[labels.length - 1]! };
+      .filter(
+        (v): v is string => typeof v === "string" && parseTimestamp(v) !== null,
+      );
+    if (labels.length > 0)
+      timeRange = { start: labels[0]!, end: labels[labels.length - 1]! };
   }
 
   return {
@@ -539,15 +593,25 @@ export function buildDemoDataset(): Dataset {
 
     let downtime = rand() < 0.06 ? 4 + rand() * 6 : rand() * 1.6;
 
-    let grade = 2.4 - i * 0.0042 + Math.sin(i / 14) * 0.09 + (rand() - 0.5) * 0.14;
+    let grade =
+      2.4 - i * 0.0042 + Math.sin(i / 14) * 0.09 + (rand() - 0.5) * 0.14;
 
     let throughput =
-      1850 - downtime * 130 - (2.4 - grade) * 45 + Math.sin(i / 11) * 28 + (rand() - 0.5) * 42;
+      1850 -
+      downtime * 130 -
+      (2.4 - grade) * 45 +
+      Math.sin(i / 11) * 28 +
+      (rand() - 0.5) * 42;
 
     let energy =
-      18.6 + i * 0.011 + (2.4 - grade) * 1.9 + downtime * 0.9 + (rand() - 0.5) * 0.5;
+      18.6 +
+      i * 0.011 +
+      (2.4 - grade) * 1.9 +
+      downtime * 0.9 +
+      (rand() - 0.5) * 0.5;
 
-    const water = 940 + throughput * 0.052 + Math.sin(i / 7) * 12 + (rand() - 0.5) * 16;
+    const water =
+      940 + throughput * 0.052 + Math.sin(i / 7) * 12 + (rand() - 0.5) * 16;
 
     // Seeded incidents so the anomaly layer has something real to flag.
     if (i === 43) energy *= 1.36;

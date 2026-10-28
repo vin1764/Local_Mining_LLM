@@ -130,7 +130,7 @@ describe("GitHub Pages AI client", () => {
     expect(res.ok && res.insights.findings[0]!.observation).toMatch(
       /^(Rose|Fell|Roughly flat)/,
     );
-    expect(res.ok && res.insights.safety!.status).toBe("INSUFFICIENT_DATA");
+    expect(res.ok && res.insights.safety!.status).toBe("CAUTION");
   });
 
   it("never falls back to a remote service", async () => {

@@ -87,7 +87,7 @@ describe("deterministic facts", () => {
     expect(sheet).toMatch(/airflow_m3s \(unit m³\/s\): FELL\. Fell 14\.8%/);
     expect(sheet).toContain("co_ppm (unit ppm)");
     expect(sheet).toContain("SAFETY ASSESSMENT (rule-based, final):");
-    expect(sheet).toContain("STATUS: INSUFFICIENT_DATA");
+    expect(sheet).toContain("STATUS: CAUTION");
   });
 
   it("assigns severity with the documented rule", () => {

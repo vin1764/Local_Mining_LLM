@@ -3,6 +3,12 @@ import {
   SAFETY_STATUS_LABEL,
   type SafetyAssessment,
 } from "@/lib/safety/assess";
+import { VERIFICATION_LABEL } from "@/lib/safety/config";
+import {
+  RESULT_TEXT,
+  formatReading,
+  formatThreshold,
+} from "@/lib/safety/format";
 
 export interface AnalysisRecord {
   insights: DatasetInsights;
@@ -31,21 +37,43 @@ export function buildMarkdownReport(
     safetyLines.push(
       `## Safety status: ${SAFETY_STATUS_LABEL[assessment.status]}`,
       "",
-      `_Rule-based classification of readings up to ${assessment.dataAsOf ?? "—"} (thresholds: ${assessment.rulesSource})._`,
+      `_Rule-based classification. Newest reading: ${assessment.latestTimestamp ?? "—"}${assessment.isStale ? " (STALE)" : ""}. Rules: ${assessment.configName}._`,
       "",
       ...assessment.reasons.map((r) => `- ${r}`),
       "",
     );
-    if (assessment.evaluations.length) {
+    if (assessment.dataQuality.length) {
       safetyLines.push(
-        "| Parameter | Check | Latest | 1-hour moving average | Worst (last 60 min) | Warning | Critical | Source |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- |",
-        ...assessment.evaluations.map((e) => {
-          const op = e.direction === "above" ? "≥" : "≤";
-          const v = (x: number | null) =>
-            x === null ? "—" : `${x} ${e.unit}`.trim();
-          return `| ${e.column} | ${e.level.toUpperCase()} | ${v(e.latestValue)} | ${v(e.movingAvg1h)} | ${v(e.worstValue)} | ${e.warning === null ? "—" : `${op} ${e.warning} ${e.unit}`} | ${op} ${e.critical} ${e.unit} | ${e.source} |`;
-        }),
+        "**Data-quality warnings:**",
+        "",
+        ...assessment.dataQuality.map((q) => `- ${q.message}`),
+        "",
+      );
+    }
+    const shown = assessment.evaluations.filter(
+      (e) => e.result !== "not_evaluated",
+    );
+    if (shown.length) {
+      safetyLines.push(
+        "| Rule | Parameter | Result | Latest | 1-hour moving average | Worst (window) | Warning | Critical | Status | Source |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        ...shown.map(
+          (e) =>
+            `| ${e.ruleId} | ${e.parameter} | ${RESULT_TEXT[e.result]} | ${formatReading(e.latestValue, e.unit)} | ${formatReading(e.movingAvg1h, e.unit)} | ${formatReading(e.worstValue, e.unit)} | ${formatThreshold(e, "warning")} | ${formatThreshold(e, "critical")} | ${VERIFICATION_LABEL[e.verificationStatus]} | ${e.sourceClause.replace(/\|/g, "/")} |`,
+        ),
+        "",
+      );
+    }
+    const notChecked = assessment.evaluations.filter(
+      (e) => e.result === "not_evaluated",
+    );
+    if (notChecked.length) {
+      safetyLines.push(
+        "**Rules not checked:**",
+        "",
+        ...notChecked.map(
+          (e) => `- ${e.ruleId} (${e.parameter}): ${e.notEvaluatedReason}`,
+        ),
         "",
       );
     }
@@ -65,14 +93,6 @@ export function buildMarkdownReport(
         "**Rule-based next actions:**",
         "",
         ...assessment.nextActions.map((a) => `- ${a}`),
-        "",
-      );
-    }
-    if (assessment.dataQualityNotes.length) {
-      safetyLines.push(
-        "**Data quality:**",
-        "",
-        ...assessment.dataQualityNotes.map((n) => `- ${n}`),
         "",
       );
     }

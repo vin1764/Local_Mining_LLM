@@ -12,9 +12,15 @@ This app is **offline-first**. Keep it that way:
 - Servers bind to `127.0.0.1` (see `vite.config.ts` and `scripts/start.mjs`).
 - Saved runs live in IndexedDB (`src/lib/storage/runs.ts`). Nothing is sent to a server.
 - Run `npm test` and `npm run build` after changes. See README.md for setup.
-- Safety status comes only from `assessSafety()` (`src/lib/safety/assess.ts`).
-  Never let model output set or change it, and never add thresholds without a
-  verified, cited source (`src/config/safety-rules.ts`).
+- Safety status comes only from `assessSafety()` (`src/lib/safety/assess.ts`)
+  and is only ever SAFE, CAUTION or UNSAFE. Never let model output set or change it.
+- Thresholds live in `src/config/safety-rules.json` (validated by
+  `src/lib/safety/config.ts`). Never add or enable a number without checking it
+  against the original document; record the clause and verification in
+  `source`, and add the evidence to `docs/safety-sources.md`. Unverified values
+  stay `null` with `requires_verification`. Provisional rules stay disabled.
+- A missing reading or an empty rule set must never produce SAFE. Tests in
+  `src/test/safety.test.ts` and `src/test/config.test.ts` guard this.
 - The AI system prompt lives in `src/lib/ai/prompts.ts`.
 - The local AI API (`src/lib/local-api.server.ts`) must keep its exact-origin
   CORS allowlist; never use `*`.

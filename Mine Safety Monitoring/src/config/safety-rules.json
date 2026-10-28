@@ -1,0 +1,795 @@
+{
+  "schemaVersion": 1,
+  "name": "STRATA built-in rules — Coal Mines Regulations, 2017",
+  "mineContext": {
+    "country": "India",
+    "mineType": "underground coal mine",
+    "degreeOfGassiness": null,
+    "applicabilityNote": "Rules follow CMR 2017 for underground coal mines. Set degreeOfGassiness (1, 2 or 3) in a site file to enable Reg. 166 methane rules, and verify each rule's location context."
+  },
+  "dataQuality": {
+    "expectedSamplingIntervalSeconds": null,
+    "staleAfterMinutes": 15,
+    "evaluationWindowMinutes": 60,
+    "parameterStaleFactor": 3,
+    "derivedIndicatorTolerancePct": 5,
+    "note": "Software settings, not safety limits. Set expectedSamplingIntervalSeconds to your sensors' reporting interval; when null it is inferred from the data."
+  },
+  "parameters": [
+    {
+      "name": "CO_ppm",
+      "unit": "ppm",
+      "type": "number",
+      "description": "Carbon monoxide",
+      "min": 0,
+      "max": 1000000
+    },
+    {
+      "name": "CH4_vol_pct",
+      "unit": "%vol",
+      "type": "number",
+      "description": "Methane (inflammable gas)",
+      "min": 0,
+      "max": 100
+    },
+    {
+      "name": "O2_vol_pct",
+      "unit": "%vol",
+      "type": "number",
+      "description": "Oxygen",
+      "min": 0,
+      "max": 100
+    },
+    {
+      "name": "CO2_vol_pct",
+      "unit": "%vol",
+      "type": "number",
+      "description": "Carbon dioxide",
+      "min": 0,
+      "max": 100
+    },
+    {
+      "name": "H2_ppm",
+      "unit": "ppm",
+      "type": "number",
+      "description": "Hydrogen",
+      "min": 0,
+      "max": 1000000
+    },
+    {
+      "name": "C2H4_ppm",
+      "unit": "ppm",
+      "type": "number",
+      "description": "Ethylene",
+      "min": 0,
+      "max": 1000000
+    },
+    {
+      "name": "C2H2_ppm",
+      "unit": "ppm",
+      "type": "number",
+      "description": "Acetylene",
+      "min": 0,
+      "max": 1000000
+    },
+    {
+      "name": "Coal_Seam_Temp_C",
+      "unit": "°C",
+      "type": "number",
+      "description": "Coal seam temperature",
+      "min": -273.15
+    },
+    {
+      "name": "Airway_Temp_C",
+      "unit": "°C",
+      "type": "number",
+      "description": "Airway air temperature (dry-bulb unless stated otherwise)",
+      "min": -273.15
+    },
+    {
+      "name": "Thermal_IR_Max_C",
+      "unit": "°C",
+      "type": "number",
+      "description": "Maximum surface temperature from thermal infrared camera",
+      "min": -273.15
+    },
+    {
+      "name": "Air_Velocity_m_s",
+      "unit": "m/s",
+      "type": "number",
+      "description": "Air velocity",
+      "min": 0
+    },
+    {
+      "name": "Barometric_Pressure_kPa",
+      "unit": "kPa",
+      "type": "number",
+      "description": "Barometric pressure",
+      "min": 0
+    },
+    {
+      "name": "Smoke_Obscuration_pct",
+      "unit": "%",
+      "type": "number",
+      "description": "Smoke obscuration",
+      "min": 0,
+      "max": 100
+    },
+    {
+      "name": "Grahams_Ratio",
+      "unit": "%",
+      "type": "number",
+      "description": "Graham's ratio: CO formed / O2 absorbed × 100",
+      "min": 0
+    },
+    {
+      "name": "Trickett_Ratio",
+      "unit": "ratio",
+      "type": "number",
+      "description": "Jones and Trickett ratio: (CO2 + 0.75 CO − 0.25 H2) / ΔO2"
+    },
+    {
+      "name": "Explosion_Risk_Index",
+      "unit": "index",
+      "type": "number",
+      "description": "Application-specific explosion risk index (formula not defined in this repository)"
+    },
+    {
+      "name": "YOLO_Flame_Detected",
+      "unit": "boolean",
+      "type": "boolean",
+      "description": "Camera model (YOLO) flame detection"
+    },
+    {
+      "name": "YOLO_Smoke_Detected",
+      "unit": "boolean",
+      "type": "boolean",
+      "description": "Camera model (YOLO) smoke detection"
+    }
+  ],
+  "rules": [
+    {
+      "warningThreshold": 0.8,
+      "criticalThreshold": 1.25,
+      "context": {
+        "location": "any_place",
+        "note": "Applies to any place in the mine."
+      },
+      "requiredForSafe": true,
+      "id": "cmr153-ch4-any-place",
+      "parameter": "CH4_vol_pct",
+      "unit": "%vol",
+      "operator": "greater_than",
+      "severity": "critical",
+      "verificationStatus": "verified_regulatory",
+      "enabled": true,
+      "source": {
+        "document": "Coal Mines Regulations, 2017 (Gazette of India: Extraordinary, Part II Sec. 3(i), G.S.R. 1449(E), 27 Nov 2017)",
+        "clause": "Reg. 153(2)(c) (critical: does not exceed 1.25 in any place); Reg. 169(1)(c)(i) (warning: above 0.8 determinations at ≤24 h intervals); Reg. 169(1)(e) (above 1.25 electric supply cut off)",
+        "url": "https://dgms.gov.in/UserView/index?mid=1654",
+        "localReference": "docs/safety-sources.md",
+        "independentCopy": "https://indiankanoon.org/doc/103528955/",
+        "verification": {
+          "method": "Clause text checked word-for-word in a reproduction of the Gazette pages (ielrc.org/content/e1712.pdf) and an independent copy (indiankanoon.org). DGMS/e-Gazette official copy and later amendments could not be checked.",
+          "checkedOn": "2026-10-28",
+          "officialCopyChecked": false,
+          "amendmentsChecked": false
+        }
+      },
+      "explanation": "Methane above 1.25% anywhere breaches Reg. 153(2)(c) and requires power to be cut off in the district (Reg. 169(1)(e)). Above 0.8% the regulation requires determinations at least every 24 hours."
+    },
+    {
+      "warningThreshold": null,
+      "criticalThreshold": 19,
+      "context": {
+        "location": "where_persons_work_or_pass",
+        "note": "Every place where persons are required to work or pass."
+      },
+      "requiredForSafe": true,
+      "id": "cmr153-o2-min",
+      "parameter": "O2_vol_pct",
+      "unit": "%vol",
+      "operator": "less_than",
+      "severity": "critical",
+      "verificationStatus": "verified_regulatory",
+      "enabled": true,
+      "source": {
+        "document": "Coal Mines Regulations, 2017 (Gazette of India: Extraordinary, Part II Sec. 3(i), G.S.R. 1449(E), 27 Nov 2017)",
+        "clause": "Reg. 153(2)(b): air shall not contain less than 19 per cent. of oxygen",
+        "url": "https://dgms.gov.in/UserView/index?mid=1654",
+        "localReference": "docs/safety-sources.md",
+        "independentCopy": "https://indiankanoon.org/doc/103528955/",
+        "verification": {
+          "method": "Clause text checked word-for-word in a reproduction of the Gazette pages (ielrc.org/content/e1712.pdf) and an independent copy (indiankanoon.org). DGMS/e-Gazette official copy and later amendments could not be checked.",
+          "checkedOn": "2026-10-28",
+          "officialCopyChecked": false,
+          "amendmentsChecked": false
+        }
+      },
+      "explanation": "Oxygen below 19% breaches Reg. 153(2)(b)."
+    },
+    {
+      "warningThreshold": null,
+      "criticalThreshold": 0.5,
+      "context": {
+        "location": "where_persons_work_or_pass",
+        "note": "Every place where persons are required to work or pass."
+      },
+      "requiredForSafe": true,
+      "id": "cmr153-co2-max",
+      "parameter": "CO2_vol_pct",
+      "unit": "%vol",
+      "operator": "greater_than",
+      "severity": "critical",
+      "verificationStatus": "verified_regulatory",
+      "enabled": true,
+      "source": {
+        "document": "Coal Mines Regulations, 2017 (Gazette of India: Extraordinary, Part II Sec. 3(i), G.S.R. 1449(E), 27 Nov 2017)",
+        "clause": "Reg. 153(2)(b): air shall not contain more than 0.5 per cent. of carbon dioxide",
+        "url": "https://dgms.gov.in/UserView/index?mid=1654",
+        "localReference": "docs/safety-sources.md",
+        "independentCopy": "https://indiankanoon.org/doc/103528955/",
+        "verification": {
+          "method": "Clause text checked word-for-word in a reproduction of the Gazette pages (ielrc.org/content/e1712.pdf) and an independent copy (indiankanoon.org). DGMS/e-Gazette official copy and later amendments could not be checked.",
+          "checkedOn": "2026-10-28",
+          "officialCopyChecked": false,
+          "amendmentsChecked": false
+        }
+      },
+      "explanation": "Carbon dioxide above 0.5% breaches Reg. 153(2)(b)."
+    },
+    {
+      "warningThreshold": null,
+      "criticalThreshold": null,
+      "context": {
+        "location": "camera_field_of_view",
+        "note": "A positive camera detection is treated as a sign that a fire may have broken out until a competent person confirms otherwise. The detection model's accuracy is not validated here."
+      },
+      "requiredForSafe": false,
+      "id": "cmr138-flame-detected",
+      "parameter": "YOLO_Flame_Detected",
+      "unit": "boolean",
+      "operator": "is_true",
+      "severity": "critical",
+      "verificationStatus": "verified_regulatory",
+      "enabled": true,
+      "source": {
+        "document": "Coal Mines Regulations, 2017 (Gazette of India: Extraordinary, Part II Sec. 3(i), G.S.R. 1449(E), 27 Nov 2017)",
+        "clause": "Reg. 138(1): on the appearance of smoke or other signs indicating that a fire has or may have broken out, persons shall be immediately withdrawn",
+        "url": "https://dgms.gov.in/UserView/index?mid=1654",
+        "localReference": "docs/safety-sources.md",
+        "independentCopy": "https://indiankanoon.org/doc/81632965/",
+        "verification": {
+          "method": "Clause text checked word-for-word in a reproduction of the Gazette pages (ielrc.org/content/e1712.pdf) and an independent copy (indiankanoon.org). DGMS/e-Gazette official copy and later amendments could not be checked.",
+          "checkedOn": "2026-10-28",
+          "officialCopyChecked": false,
+          "amendmentsChecked": false
+        }
+      },
+      "explanation": "A flame detection is a sign that a fire may have broken out; Reg. 138(1) requires immediate action and withdrawal of persons. A negative detection is not evidence that there is no fire."
+    },
+    {
+      "warningThreshold": null,
+      "criticalThreshold": null,
+      "context": {
+        "location": "camera_field_of_view",
+        "note": "Treated as the appearance of smoke until a competent person confirms otherwise. Detection accuracy is not validated here."
+      },
+      "requiredForSafe": false,
+      "id": "cmr138-smoke-detected",
+      "parameter": "YOLO_Smoke_Detected",
+      "unit": "boolean",
+      "operator": "is_true",
+      "severity": "critical",
+      "verificationStatus": "verified_regulatory",
+      "enabled": true,
+      "source": {
+        "document": "Coal Mines Regulations, 2017 (Gazette of India: Extraordinary, Part II Sec. 3(i), G.S.R. 1449(E), 27 Nov 2017)",
+        "clause": "Reg. 138(1): on the appearance of smoke … persons shall be immediately withdrawn",
+        "url": "https://dgms.gov.in/UserView/index?mid=1654",
+        "localReference": "docs/safety-sources.md",
+        "independentCopy": "https://indiankanoon.org/doc/81632965/",
+        "verification": {
+          "method": "Clause text checked word-for-word in a reproduction of the Gazette pages (ielrc.org/content/e1712.pdf) and an independent copy (indiankanoon.org). DGMS/e-Gazette official copy and later amendments could not be checked.",
+          "checkedOn": "2026-10-28",
+          "officialCopyChecked": false,
+          "amendmentsChecked": false
+        }
+      },
+      "explanation": "A smoke detection is the appearance of smoke under Reg. 138(1). A negative detection is not evidence that there is no smoke."
+    },
+    {
+      "warningThreshold": null,
+      "criticalThreshold": 0.75,
+      "context": {
+        "location": "return_air",
+        "note": "Only for a sensor in the general body of the return air of a ventilating district. Enable in a site file if CH4_vol_pct is measured there."
+      },
+      "requiredForSafe": false,
+      "id": "cmr153-ch4-return-air",
+      "parameter": "CH4_vol_pct",
+      "unit": "%vol",
+      "operator": "greater_than",
+      "severity": "critical",
+      "verificationStatus": "verified_regulatory",
+      "enabled": false,
+      "source": {
+        "document": "Coal Mines Regulations, 2017 (Gazette of India: Extraordinary, Part II Sec. 3(i), G.S.R. 1449(E), 27 Nov 2017)",
+        "clause": "Reg. 153(2)(c): does not exceed 0.75 in the general body of the return air of any ventilating district",
+        "url": "https://dgms.gov.in/UserView/index?mid=1654",
+        "localReference": "docs/safety-sources.md",
+        "independentCopy": "https://indiankanoon.org/doc/103528955/",
+        "verification": {
+          "method": "Clause text checked word-for-word in a reproduction of the Gazette pages (ielrc.org/content/e1712.pdf) and an independent copy (indiankanoon.org). DGMS/e-Gazette official copy and later amendments could not be checked.",
+          "checkedOn": "2026-10-28",
+          "officialCopyChecked": false,
+          "amendmentsChecked": false
+        }
+      },
+      "explanation": "Return-air methane limit. Disabled because the sensor location is not known."
+    },
+    {
+      "warningThreshold": null,
+      "criticalThreshold": 0.1,
+      "context": {
+        "location": "any_place",
+        "gassinessDegree": 1,
+        "note": "Applies only when mineContext.degreeOfGassiness is 1."
+      },
+      "requiredForSafe": false,
+      "id": "cmr166-ch4-degree-1",
+      "parameter": "CH4_vol_pct",
+      "unit": "%vol",
+      "operator": "greater_than_or_equal",
+      "severity": "critical",
+      "verificationStatus": "verified_regulatory",
+      "enabled": true,
+      "source": {
+        "document": "Coal Mines Regulations, 2017 (Gazette of India: Extraordinary, Part II Sec. 3(i), G.S.R. 1449(E), 27 Nov 2017)",
+        "clause": "Reg. 166(1)(i) (detected at 0.1 per cent. or more, degree one) and 166(3)(a) (withdraw persons)",
+        "url": "https://dgms.gov.in/UserView/index?mid=1654",
+        "localReference": "docs/safety-sources.md",
+        "independentCopy": "https://indiankanoon.org/doc/114611967/",
+        "verification": {
+          "method": "Clause text checked word-for-word in a reproduction of the Gazette pages (ielrc.org/content/e1712.pdf) and an independent copy (indiankanoon.org). DGMS/e-Gazette official copy and later amendments could not be checked.",
+          "checkedOn": "2026-10-28",
+          "officialCopyChecked": false,
+          "amendmentsChecked": false
+        }
+      },
+      "explanation": "In a degree I gassy mine, 0.1% or more counts as inflammable gas detected; persons must be withdrawn from the place."
+    },
+    {
+      "warningThreshold": null,
+      "criticalThreshold": 0.5,
+      "context": {
+        "location": "any_place",
+        "gassinessDegree": 2,
+        "note": "Applies only when mineContext.degreeOfGassiness is 2."
+      },
+      "requiredForSafe": false,
+      "id": "cmr166-ch4-degree-2",
+      "parameter": "CH4_vol_pct",
+      "unit": "%vol",
+      "operator": "greater_than_or_equal",
+      "severity": "critical",
+      "verificationStatus": "verified_regulatory",
+      "enabled": true,
+      "source": {
+        "document": "Coal Mines Regulations, 2017 (Gazette of India: Extraordinary, Part II Sec. 3(i), G.S.R. 1449(E), 27 Nov 2017)",
+        "clause": "Reg. 166(1)(ii) (detected at 0.5 per cent. or more, degree two) and 166(3)(a)",
+        "url": "https://dgms.gov.in/UserView/index?mid=1654",
+        "localReference": "docs/safety-sources.md",
+        "independentCopy": "https://indiankanoon.org/doc/114611967/",
+        "verification": {
+          "method": "Clause text checked word-for-word in a reproduction of the Gazette pages (ielrc.org/content/e1712.pdf) and an independent copy (indiankanoon.org). DGMS/e-Gazette official copy and later amendments could not be checked.",
+          "checkedOn": "2026-10-28",
+          "officialCopyChecked": false,
+          "amendmentsChecked": false
+        }
+      },
+      "explanation": "In a degree II gassy mine, 0.5% or more counts as inflammable gas detected; persons must be withdrawn from the place."
+    },
+    {
+      "warningThreshold": null,
+      "criticalThreshold": 1.25,
+      "context": {
+        "location": "any_place",
+        "gassinessDegree": 3,
+        "note": "Applies only when mineContext.degreeOfGassiness is 3."
+      },
+      "requiredForSafe": false,
+      "id": "cmr166-ch4-degree-3",
+      "parameter": "CH4_vol_pct",
+      "unit": "%vol",
+      "operator": "greater_than_or_equal",
+      "severity": "critical",
+      "verificationStatus": "verified_regulatory",
+      "enabled": true,
+      "source": {
+        "document": "Coal Mines Regulations, 2017 (Gazette of India: Extraordinary, Part II Sec. 3(i), G.S.R. 1449(E), 27 Nov 2017)",
+        "clause": "Reg. 166(1)(iii) (one and a quarter per cent. or more, degree three) and 166(3)(a)",
+        "url": "https://dgms.gov.in/UserView/index?mid=1654",
+        "localReference": "docs/safety-sources.md",
+        "independentCopy": "https://indiankanoon.org/doc/114611967/",
+        "verification": {
+          "method": "Clause text checked word-for-word in a reproduction of the Gazette pages (ielrc.org/content/e1712.pdf) and an independent copy (indiankanoon.org). DGMS/e-Gazette official copy and later amendments could not be checked.",
+          "checkedOn": "2026-10-28",
+          "officialCopyChecked": false,
+          "amendmentsChecked": false
+        }
+      },
+      "explanation": "In a degree III gassy mine, 1.25% or more counts as inflammable gas detected; persons must be withdrawn from the place."
+    },
+    {
+      "warningThreshold": 30.5,
+      "criticalThreshold": 33.5,
+      "context": {
+        "location": "working_place",
+        "measurement": "wet_bulb",
+        "note": "Reg. 153(2)(d) is a WET-BULB limit for working places. Enable only if Airway_Temp_C is a wet-bulb reading in a working place."
+      },
+      "requiredForSafe": false,
+      "id": "cmr153-wet-bulb",
+      "parameter": "Airway_Temp_C",
+      "unit": "°C",
+      "operator": "greater_than",
+      "severity": "critical",
+      "verificationStatus": "verified_regulatory",
+      "enabled": false,
+      "source": {
+        "document": "Coal Mines Regulations, 2017 (Gazette of India: Extraordinary, Part II Sec. 3(i), G.S.R. 1449(E), 27 Nov 2017)",
+        "clause": "Reg. 153(2)(d): wet bulb temperature in any working place does not exceed 33.5 °C; above 30.5 °C air must move at not less than 1 m/s",
+        "url": "https://dgms.gov.in/UserView/index?mid=1654",
+        "localReference": "docs/safety-sources.md",
+        "independentCopy": "https://indiankanoon.org/doc/103528955/",
+        "verification": {
+          "method": "Clause text checked word-for-word in a reproduction of the Gazette pages (ielrc.org/content/e1712.pdf) and an independent copy (indiankanoon.org). DGMS/e-Gazette official copy and later amendments could not be checked.",
+          "checkedOn": "2026-10-28",
+          "officialCopyChecked": false,
+          "amendmentsChecked": false
+        }
+      },
+      "explanation": "Disabled: Airway_Temp_C is not known to be a wet-bulb temperature. Above 30.5 °C wet-bulb the regulation requires air movement of at least 1 m/s."
+    },
+    {
+      "warningThreshold": null,
+      "criticalThreshold": 30,
+      "context": {
+        "location": "immediate_outbye_ventilation_connection_from_face",
+        "note": "Reg. 160 table, all degrees of gassiness. Enable only if Air_Velocity_m_s is measured at the immediate outbye ventilation connection from the face. Other locations have different minimums (see docs/safety-sources.md)."
+      },
+      "requiredForSafe": false,
+      "id": "cmr160-velocity-outbye-connection",
+      "parameter": "Air_Velocity_m_s",
+      "unit": "m/min",
+      "operator": "less_than",
+      "severity": "critical",
+      "verificationStatus": "verified_regulatory",
+      "enabled": false,
+      "source": {
+        "document": "Coal Mines Regulations, 2017 (Gazette of India: Extraordinary, Part II Sec. 3(i), G.S.R. 1449(E), 27 Nov 2017)",
+        "clause": "Reg. 160, Table, row 1: immediate outbye ventilation connection from the face, 30 meters per minute",
+        "url": "https://dgms.gov.in/UserView/index?mid=1654",
+        "localReference": "docs/safety-sources.md",
+        "independentCopy": "https://indiankanoon.org/doc/155835856/",
+        "verification": {
+          "method": "Clause text checked word-for-word in a reproduction of the Gazette pages (ielrc.org/content/e1712.pdf) and an independent copy (indiankanoon.org). DGMS/e-Gazette official copy and later amendments could not be checked.",
+          "checkedOn": "2026-10-28",
+          "officialCopyChecked": false,
+          "amendmentsChecked": false
+        }
+      },
+      "explanation": "Minimum 30 m/min (0.5 m/s) at the immediate outbye ventilation connection. Disabled because the sensor location is not known."
+    },
+    {
+      "warningThreshold": null,
+      "criticalThreshold": null,
+      "context": {
+        "location": "any_place",
+        "note": "Required for SAFE. Add warning/critical values from your DGMS circular, Chief Inspector order or approved site standard in a site thresholds file."
+      },
+      "requiredForSafe": true,
+      "id": "co-site-limit",
+      "parameter": "CO_ppm",
+      "unit": "ppm",
+      "operator": "greater_than",
+      "severity": "critical",
+      "verificationStatus": "requires_verification",
+      "enabled": false,
+      "source": {
+        "document": "No verified source",
+        "clause": "Threshold must come from a DGMS circular, Chief Inspector order or approved site standard",
+        "url": null,
+        "localReference": "docs/safety-sources.md"
+      },
+      "explanation": "CMR 2017 sets no numeric CO limit (Reg. 153(2)(b) only prohibits noxious gas likely to affect health). Until a verified CO limit is configured the status cannot be SAFE."
+    },
+    {
+      "warningThreshold": null,
+      "criticalThreshold": null,
+      "context": {
+        "location": "any_place",
+        "note": "Reg. 138(1) covers the appearance of smoke; the alarm level of this sensor is site-specific."
+      },
+      "requiredForSafe": false,
+      "id": "smoke-obscuration-site-limit",
+      "parameter": "Smoke_Obscuration_pct",
+      "unit": "%",
+      "operator": "greater_than",
+      "severity": "critical",
+      "verificationStatus": "requires_verification",
+      "enabled": false,
+      "source": {
+        "document": "No verified source",
+        "clause": "Threshold must come from a DGMS circular, Chief Inspector order or approved site standard",
+        "url": null,
+        "localReference": "docs/safety-sources.md"
+      },
+      "explanation": "No verified obscuration alarm level. Set it from the detector manufacturer's alarm setting and your site standard."
+    },
+    {
+      "warningThreshold": 0.5,
+      "criticalThreshold": 1.0,
+      "context": {
+        "location": "return_air_or_sealed_area_sample",
+        "note": "Not meaningful when the oxygen deficiency is below 0.3% (CIMFR)."
+      },
+      "requiredForSafe": false,
+      "id": "cimfr-grahams-ratio",
+      "parameter": "Grahams_Ratio",
+      "unit": "%",
+      "operator": "greater_than_or_equal",
+      "severity": "critical",
+      "verificationStatus": "provisional",
+      "enabled": false,
+      "source": {
+        "document": "S K Ray et al., 'Assessing the status of sealed fire in underground coal mines', J. Sci. Ind. Res. 63 (2004) 579-591, CSIR-CIMFR (technical guidance, not regulation)",
+        "clause": "Fire Ratios section",
+        "url": "https://cimfr.csircentral.net/103/1/JSIR_63(7)_579-591.pdf",
+        "localReference": "docs/safety-sources.md",
+        "verification": {
+          "method": "Read in the original paper; formula checked against the paper's Table 2.",
+          "checkedOn": "2026-10-28",
+          "officialCopyChecked": true,
+          "amendmentsChecked": false
+        }
+      },
+      "explanation": "CIMFR thumb rule: ≤0.4% normal, 0.5% thorough check-up, 1% heating, 2% serious heating, ≥3% active fire. Provisional monitoring only: can raise CAUTION, never UNSAFE."
+    },
+    {
+      "warningThreshold": null,
+      "criticalThreshold": null,
+      "context": {
+        "location": "return_airway_of_depillaring_district",
+        "note": "Reg. 137(12)(b) requires action on a 'steady increase' but does not define how many successive increases; 3 is a provisional choice."
+      },
+      "requiredForSafe": false,
+      "id": "cmr137-grahams-steady-increase",
+      "parameter": "Grahams_Ratio",
+      "unit": "%",
+      "operator": "steady_increase",
+      "consecutiveIncreases": 3,
+      "severity": "warning",
+      "verificationStatus": "provisional",
+      "enabled": false,
+      "source": {
+        "document": "Coal Mines Regulations, 2017 (Gazette of India: Extraordinary, Part II Sec. 3(i), G.S.R. 1449(E), 27 Nov 2017)",
+        "clause": "Reg. 137(12)(b): if successive tests show any steady increase in the CO-formed/O2 absorbed ratio, suitable measures shall be taken",
+        "url": "https://dgms.gov.in/UserView/index?mid=1654",
+        "localReference": "docs/safety-sources.md",
+        "independentCopy": "https://indiankanoon.org/doc/41752756/",
+        "verification": {
+          "method": "Clause text checked word-for-word in a reproduction of the Gazette pages (ielrc.org/content/e1712.pdf) and an independent copy (indiankanoon.org). DGMS/e-Gazette official copy and later amendments could not be checked.",
+          "checkedOn": "2026-10-28",
+          "officialCopyChecked": false,
+          "amendmentsChecked": false
+        }
+      },
+      "explanation": "Flags a run of rising Graham's ratio readings. The number of successive increases is provisional."
+    },
+    {
+      "warningThreshold": 0,
+      "criticalThreshold": null,
+      "context": {
+        "location": "any_place",
+        "note": "Replace 0 with your analyser's detection limit."
+      },
+      "requiredForSafe": false,
+      "id": "cimfr-ethylene-presence",
+      "parameter": "C2H4_ppm",
+      "unit": "ppm",
+      "operator": "greater_than",
+      "severity": "warning",
+      "verificationStatus": "provisional",
+      "enabled": false,
+      "source": {
+        "document": "S K Ray et al., 'Assessing the status of sealed fire in underground coal mines', J. Sci. Ind. Res. 63 (2004) 579-591, CSIR-CIMFR (technical guidance, not regulation)",
+        "clause": "Fire Ratios section",
+        "url": "https://cimfr.csircentral.net/103/1/JSIR_63(7)_579-591.pdf",
+        "localReference": "docs/safety-sources.md",
+        "verification": {
+          "method": "Read in the original paper; formula checked against the paper's Table 2.",
+          "checkedOn": "2026-10-28",
+          "officialCopyChecked": true,
+          "amendmentsChecked": false
+        }
+      },
+      "explanation": "CIMFR: detection of gases above hydrogen in the liberation sequence (ethylene, propylene, acetylene) indicates an active fire. Provisional."
+    },
+    {
+      "warningThreshold": 0,
+      "criticalThreshold": null,
+      "context": {
+        "location": "any_place",
+        "note": "Replace 0 with your analyser's detection limit."
+      },
+      "requiredForSafe": false,
+      "id": "cimfr-acetylene-presence",
+      "parameter": "C2H2_ppm",
+      "unit": "ppm",
+      "operator": "greater_than",
+      "severity": "warning",
+      "verificationStatus": "provisional",
+      "enabled": false,
+      "source": {
+        "document": "S K Ray et al., 'Assessing the status of sealed fire in underground coal mines', J. Sci. Ind. Res. 63 (2004) 579-591, CSIR-CIMFR (technical guidance, not regulation)",
+        "clause": "Fire Ratios section",
+        "url": "https://cimfr.csircentral.net/103/1/JSIR_63(7)_579-591.pdf",
+        "localReference": "docs/safety-sources.md",
+        "verification": {
+          "method": "Read in the original paper; formula checked against the paper's Table 2.",
+          "checkedOn": "2026-10-28",
+          "officialCopyChecked": true,
+          "amendmentsChecked": false
+        }
+      },
+      "explanation": "CIMFR: acetylene is the last gas in the liberation sequence; its detection indicates an active fire. Provisional."
+    },
+    {
+      "warningThreshold": null,
+      "criticalThreshold": null,
+      "context": {
+        "location": "any_place"
+      },
+      "requiredForSafe": false,
+      "id": "h2-monitoring",
+      "parameter": "H2_ppm",
+      "unit": "ppm",
+      "operator": "greater_than",
+      "severity": "monitoring",
+      "verificationStatus": "requires_verification",
+      "enabled": false,
+      "source": {
+        "document": "No verified source",
+        "clause": "Threshold must come from a DGMS circular, Chief Inspector order or approved site standard",
+        "url": null,
+        "localReference": "docs/safety-sources.md"
+      },
+      "explanation": "No verified threshold. Used in the Trickett ratio; shown for monitoring."
+    },
+    {
+      "warningThreshold": null,
+      "criticalThreshold": null,
+      "context": {
+        "location": "any_place"
+      },
+      "requiredForSafe": false,
+      "id": "coal-seam-temp-monitoring",
+      "parameter": "Coal_Seam_Temp_C",
+      "unit": "°C",
+      "operator": "greater_than",
+      "severity": "monitoring",
+      "verificationStatus": "requires_verification",
+      "enabled": false,
+      "source": {
+        "document": "No verified source",
+        "clause": "Threshold must come from a DGMS circular, Chief Inspector order or approved site standard",
+        "url": null,
+        "localReference": "docs/safety-sources.md"
+      },
+      "explanation": "No verified regulatory threshold for coal seam temperature. Set a site value if your spontaneous-heating plan defines one."
+    },
+    {
+      "warningThreshold": null,
+      "criticalThreshold": null,
+      "context": {
+        "location": "any_place"
+      },
+      "requiredForSafe": false,
+      "id": "thermal-ir-monitoring",
+      "parameter": "Thermal_IR_Max_C",
+      "unit": "°C",
+      "operator": "greater_than",
+      "severity": "monitoring",
+      "verificationStatus": "requires_verification",
+      "enabled": false,
+      "source": {
+        "document": "No verified source",
+        "clause": "Threshold must come from a DGMS circular, Chief Inspector order or approved site standard",
+        "url": null,
+        "localReference": "docs/safety-sources.md"
+      },
+      "explanation": "No verified threshold for camera surface temperature. Set a site value."
+    },
+    {
+      "warningThreshold": null,
+      "criticalThreshold": null,
+      "context": {
+        "location": "any_place"
+      },
+      "requiredForSafe": false,
+      "id": "barometric-pressure-monitoring",
+      "parameter": "Barometric_Pressure_kPa",
+      "unit": "kPa",
+      "operator": "greater_than",
+      "severity": "monitoring",
+      "verificationStatus": "requires_verification",
+      "enabled": false,
+      "source": {
+        "document": "Coal Mines Regulations, 2017 (Gazette of India: Extraordinary, Part II Sec. 3(i), G.S.R. 1449(E), 27 Nov 2017)",
+        "clause": "Reg. 46(1)(o): report any unusual change in barometric pressure (no numeric limit)",
+        "url": "https://dgms.gov.in/UserView/index?mid=1654",
+        "localReference": "docs/safety-sources.md",
+        "independentCopy": "https://indiankanoon.org/doc/10477029/",
+        "verification": {
+          "method": "Clause text checked word-for-word in a reproduction of the Gazette pages (ielrc.org/content/e1712.pdf) and an independent copy (indiankanoon.org). DGMS/e-Gazette official copy and later amendments could not be checked.",
+          "checkedOn": "2026-10-28",
+          "officialCopyChecked": false,
+          "amendmentsChecked": false
+        }
+      },
+      "explanation": "The regulation asks for 'unusual change' to be reported but gives no number. Shown for monitoring."
+    },
+    {
+      "warningThreshold": null,
+      "criticalThreshold": null,
+      "context": {
+        "location": "any_place"
+      },
+      "requiredForSafe": false,
+      "id": "trickett-ratio-monitoring",
+      "parameter": "Trickett_Ratio",
+      "unit": "ratio",
+      "operator": "greater_than",
+      "severity": "monitoring",
+      "verificationStatus": "requires_verification",
+      "enabled": false,
+      "source": {
+        "document": "S K Ray et al., 'Assessing the status of sealed fire in underground coal mines', J. Sci. Ind. Res. 63 (2004) 579-591, CSIR-CIMFR (technical guidance, not regulation)",
+        "clause": "Fire Ratios section",
+        "url": "https://cimfr.csircentral.net/103/1/JSIR_63(7)_579-591.pdf",
+        "localReference": "docs/safety-sources.md",
+        "verification": {
+          "method": "Read in the original paper; formula checked against the paper's Table 2.",
+          "checkedOn": "2026-10-28",
+          "officialCopyChecked": true,
+          "amendmentsChecked": false
+        }
+      },
+      "explanation": "Fuel-type indicator (CIMFR: 0.4–0.5 methane, 0.5–1 coal/oil/belt, 0.9–1.6 timber), not a hazard level."
+    },
+    {
+      "warningThreshold": null,
+      "criticalThreshold": null,
+      "context": {
+        "location": "any_place"
+      },
+      "requiredForSafe": false,
+      "id": "explosion-risk-index-monitoring",
+      "parameter": "Explosion_Risk_Index",
+      "unit": "index",
+      "operator": "greater_than",
+      "severity": "monitoring",
+      "verificationStatus": "requires_verification",
+      "enabled": false,
+      "source": {
+        "document": "No verified source",
+        "clause": "Threshold must come from a DGMS circular, Chief Inspector order or approved site standard",
+        "url": null,
+        "localReference": "docs/safety-sources.md"
+      },
+      "explanation": "Application-specific index; its formula and scale are not defined in this repository, so no threshold can be verified."
+    }
+  ]
+}

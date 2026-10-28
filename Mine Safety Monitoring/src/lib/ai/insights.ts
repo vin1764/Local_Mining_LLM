@@ -31,43 +31,84 @@ const finite = z.number().finite();
 const shortText = z.string().max(300);
 
 const nullableFinite = finite.nullable();
+const statusEnum = z.enum(["SAFE", "CAUTION", "UNSAFE"]);
+const text = (n: number) => z.string().max(n);
 const safetySchema = z.object({
-  status: z.enum(["SAFE", "CAUTION", "UNSAFE", "INSUFFICIENT_DATA"]),
-  reasons: z.array(z.string().max(400)).max(20),
+  status: statusEnum,
+  reasons: z.array(text(400)).max(20),
   evaluations: z
     .array(
       z.object({
         ruleId: shortText,
-        label: shortText,
-        column: shortText,
-        unit: z.string().max(20),
-        direction: z.enum(["above", "below"]),
-        warning: nullableFinite,
-        critical: finite,
-        source: shortText,
-        level: z.enum([
-          "ok",
-          "warning",
-          "critical",
-          "no_data",
-          "stale",
-          "invalid",
+        parameter: shortText,
+        unit: text(20),
+        ruleUnit: text(20),
+        operator: z.enum([
+          "greater_than",
+          "greater_than_or_equal",
+          "less_than",
+          "less_than_or_equal",
+          "is_true",
+          "steady_increase",
         ]),
-        latestValue: nullableFinite,
+        warning: nullableFinite,
+        critical: nullableFinite,
+        severity: z.enum(["critical", "warning", "monitoring"]),
+        verificationStatus: z.enum([
+          "verified_regulatory",
+          "verified_site",
+          "provisional",
+          "requires_verification",
+        ]),
+        enabled: z.boolean(),
+        requiredForSafe: z.boolean(),
+        sourceDocument: text(400),
+        sourceClause: text(600),
+        sourceUrl: text(400).nullable(),
+        officialCopyChecked: z.boolean().nullable(),
+        contextNote: text(400).nullable(),
+        result: z.enum(["ok", "warning", "critical", "not_evaluated"]),
+        notEvaluatedReason: text(400).nullable(),
+        effect: z.enum(["UNSAFE", "CAUTION", "none"]),
+        latestValue: z.union([finite, z.boolean()]).nullable(),
         latestAt: shortText.nullable(),
-        worstValue: nullableFinite,
+        worstValue: z.union([finite, z.boolean()]).nullable(),
         worstAt: shortText.nullable(),
         movingAvg1h: nullableFinite,
-        explanation: z.string().max(400),
+        explanation: text(1200),
       }),
     )
-    .max(20),
-  dataQualityNotes: z.array(z.string().max(400)).max(20),
-  nextActions: z.array(z.string().max(400)).max(20).default([]),
+    .max(40),
+  dataQuality: z
+    .array(
+      z.object({
+        code: text(40),
+        message: text(400),
+        parameter: shortText.optional(),
+        blocksSafe: z.boolean(),
+      }),
+    )
+    .max(30),
+  nextActions: z.array(text(400)).max(20),
+  triggeredRuleIds: z.array(shortText).max(40),
+  latestTimestamp: shortText.nullable(),
+  latestTimestampIso: shortText.nullable(),
+  dataAgeMinutes: finite.nullable(),
+  isStale: z.boolean(),
+  samplingIntervalSeconds: finite.nullable(),
+  rulesSummary: z.object({
+    total: z.number().int(),
+    enabled: z.number().int(),
+    evaluated: z.number().int(),
+    verifiedRegulatory: z.number().int(),
+    verifiedSite: z.number().int(),
+    provisional: z.number().int(),
+    requiresVerification: z.number().int(),
+  }),
+  unverifiedRequired: z.array(shortText).max(40),
   unassessedParameters: z.array(shortText).max(50),
-  dataAsOf: shortText.nullable(),
-  rulesSource: shortText,
-  ruleCount: z.number().int().nonnegative(),
+  configName: text(400),
+  officialCopyCaveat: z.boolean(),
 });
 
 export const profileSchema = z.object({
@@ -356,7 +397,7 @@ export function buildUserPrompt(
     "- summary: 2 to 4 sentences on the period and the main movements, directions copied from FACTS.",
     "- notes: for each finding parameter, one short sentence with a possible explanation or what to check, without numbers. Start with May, Possibly or Could.",
     "- recommendations: 2 to 5 short, concrete checks for the next shift.",
-    `- safety_status: exactly "${profile.safety?.status ?? "INSUFFICIENT_DATA"}" (copied from SAFETY ASSESSMENT).`,
+    `- safety_status: exactly "${profile.safety?.status ?? "CAUTION"}" (copied from SAFETY ASSESSMENT).`,
     "- safety_explanation: 1 to 3 sentences explaining that status from the SAFETY ASSESSMENT evidence.",
   ].join("\n");
 }
@@ -378,7 +419,7 @@ export const insightsJsonSchema = {
     recommendations: { type: "array", items: { type: "string" } },
     safety_status: {
       type: "string",
-      enum: ["SAFE", "CAUTION", "UNSAFE", "INSUFFICIENT_DATA"],
+      enum: ["SAFE", "CAUTION", "UNSAFE"],
     },
     safety_explanation: { type: "string" },
   },
@@ -584,6 +625,81 @@ export function findSafetyClaimConflict(
   return null;
 }
 
+const BREACH_CLAIM =
+  /\bbreach(es|ed|ing)?\b|\bexceed(s|ed|ing)?\b[^,;]*\b(limits?|thresholds?|cut-?off)\b|\babove (the |its )?(critical|warning|safe|permissible)\b/i;
+const COMMON_NAMES: Record<string, string[]> = {
+  ch4: ["methane", "firedamp"],
+  o2: ["oxygen"],
+  co2: ["carbon dioxide"],
+  co: ["carbon monoxide"],
+  h2: ["hydrogen"],
+  c2h4: ["ethylene"],
+  c2h2: ["acetylene"],
+};
+
+/** Ways model text may refer to a column: its name, its spaced name, its gas formula. */
+function aliasesOf(name: string): RegExp {
+  const lower = name.toLowerCase();
+  const head = lower.split("_")[0]!;
+  const words = [
+    lower,
+    lower.replace(/_/g, " "),
+    ...(COMMON_NAMES[head] ?? []),
+  ];
+  if (COMMON_NAMES[head]) words.push(head);
+  const esc = words.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  return new RegExp(`(^|[^a-z0-9])(${esc.join("|")})(?![a-z0-9])`, "i");
+}
+
+/**
+ * Does model text say a parameter breached a limit when the rules checked it
+ * and found no breach (e.g. "CO2 exceeded critical limits" when only methane
+ * did)? Returns a short reason, or null.
+ */
+export function findBreachMisattribution(
+  text: string,
+  profile: DatasetProfile,
+): string | null {
+  const evals = profile.safety?.evaluations ?? [];
+  const byParam = new Map<string, { checked: boolean; triggered: boolean }>();
+  for (const e of evals) {
+    const cur = byParam.get(e.parameter) ?? {
+      checked: false,
+      triggered: false,
+    };
+    if (e.result !== "not_evaluated") cur.checked = true;
+    if (e.result === "warning" || e.result === "critical") cur.triggered = true;
+    byParam.set(e.parameter, cur);
+  }
+  const clean = [...byParam].filter(([, v]) => v.checked && !v.triggered);
+  if (clean.length === 0) return null;
+  const clauses = text
+    .split(/[.;!?,]|\bwhile\b|\bwhereas\b|\band\b|\bbut\b|\bhowever\b/i)
+    .map((c) => c.trim())
+    .filter(Boolean);
+  for (const c of clauses) {
+    if (!BREACH_CLAIM.test(c) || NEGATION.test(c) || HEDGE.test(c)) continue;
+    for (const [param] of clean) {
+      if (aliasesOf(param).test(c)) {
+        return `it says ${param} breached a limit, but the rules checked ${param} and found no breach`;
+      }
+    }
+  }
+  return null;
+}
+
+/** Status claims and misattributed breaches, in one check. */
+export function findSafetyWordingConflict(
+  text: string,
+  status: SafetyStatus,
+  profile: DatasetProfile,
+): string | null {
+  return (
+    findSafetyClaimConflict(text, status) ??
+    findBreachMisattribution(text, profile)
+  );
+}
+
 function clip(s: string, max: number): string {
   const t = s.replace(/\s+/g, " ").trim();
   return t.length > max ? `${t.slice(0, max - 1).trimEnd()}…` : t;
@@ -612,9 +728,10 @@ export function normaliseInsights(
   if (!parsed.success) return null;
   const raw = parsed.data;
   let dropped = 0;
-  const status: SafetyStatus = profile.safety?.status ?? "INSUFFICIENT_DATA";
+  // Without a rule-based assessment the analysis can never be SAFE.
+  const status: SafetyStatus = profile.safety?.status ?? "CAUTION";
   const claimConflict = (t: string) =>
-    findSafetyClaimConflict(t, status) !== null;
+    findSafetyWordingConflict(t, status, profile) !== null;
   const allowed = allowedNumbers(profile);
   const grounded = (text: string) =>
     findUngroundedNumbers(text, allowed).length === 0;
@@ -693,9 +810,10 @@ export function normaliseInsights(
   if (modelStatus && modelStatus !== status) {
     safetyConflict = `the model reported ${modelStatus} but the rule-based status is ${status}`;
   } else {
-    safetyConflict = findSafetyClaimConflict(
+    safetyConflict = findSafetyWordingConflict(
       `${headline}. ${summary}. ${explanation}`,
       status,
+      profile,
     );
   }
 
