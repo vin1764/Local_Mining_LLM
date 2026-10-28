@@ -1,5 +1,8 @@
 import Papa from "papaparse";
 
+import { movingAverage, parseTimestamp } from "@/lib/moving-average";
+import { compactAssessment, type SafetyAssessment, type SafetyStatus } from "@/lib/safety/assess";
+
 /* ============================ Types ============================ */
 
 export type ColumnType = "number" | "time" | "category";
@@ -71,6 +74,10 @@ export interface ProfileColumn {
   anomalyCount?: number;
   /** Largest |z-score| of any value in this column. */
   maxAbsZ?: number;
+  /** 1-hour moving average at the latest valid reading (needs a time column). */
+  movingAvg1h?: number;
+  /** Number of readings in that 1-hour window. */
+  movingAvg1hCount?: number;
   distinct?: number;
 }
 
@@ -84,6 +91,8 @@ export interface DatasetProfile {
   correlations: { a: string; b: string; r: number }[];
   anomalies: { column: string; label: string; value: number; z: number }[];
   samples: { first: string[]; last: string[] };
+  /** Rule-based safety classification (computed in the browser from all rows). */
+  safety?: SafetyAssessment;
 }
 
 export interface DatasetInsights {
@@ -99,6 +108,17 @@ export interface DatasetInsights {
     interpretation?: string;
   }[];
   recommendations: string[];
+  /**
+   * Safety classification. `status` is always copied from the rule-based
+   * assessment, never taken from the model. `explanation` is the model's
+   * wording; `needsReview` is set when that wording conflicts with the status.
+   */
+  safety?: {
+    status: SafetyStatus;
+    explanation?: string;
+    needsReview: boolean;
+    reviewReason?: string;
+  };
 }
 
 /* ============================ Parsing ============================ */
@@ -356,16 +376,20 @@ export function computeCorrelations(dataset: Dataset, maxPairs = 8): Correlation
 
 /* ============================ Charting ============================ */
 
-export function buildChartRows(dataset: Dataset, selected: string[]): ChartRow[] {
-  let ordered = dataset.rows;
+/** Rows in the order the charts plot them (by time when there is a time column). */
+export function chartOrderedRows(dataset: Dataset): Dataset["rows"] {
   const tc = dataset.timeColumn;
-  if (tc) {
-    ordered = [...dataset.rows].sort((a, b) => {
-      const ta = Date.parse(String(a[tc] ?? ""));
-      const tb = Date.parse(String(b[tc] ?? ""));
-      return (Number.isNaN(ta) ? 0 : ta) - (Number.isNaN(tb) ? 0 : tb);
-    });
-  }
+  if (!tc) return dataset.rows;
+  return [...dataset.rows].sort((a, b) => {
+    const ta = Date.parse(String(a[tc] ?? ""));
+    const tb = Date.parse(String(b[tc] ?? ""));
+    return (Number.isNaN(ta) ? 0 : ta) - (Number.isNaN(tb) ? 0 : tb);
+  });
+}
+
+export function buildChartRows(dataset: Dataset, selected: string[]): ChartRow[] {
+  const ordered = chartOrderedRows(dataset);
+  const tc = dataset.timeColumn;
 
   return ordered.map((row, idx) => {
     const out: ChartRow = {
@@ -402,7 +426,9 @@ export function shortLabel(label: string): string {
 
 /* ============================ AI profile ============================ */
 
-export function buildProfile(dataset: Dataset): DatasetProfile {
+export function buildProfile(dataset: Dataset, safety?: SafetyAssessment): DatasetProfile {
+  const tcm = dataset.timeColumn;
+  const times = tcm ? dataset.rows.map((r) => parseTimestamp(r[tcm])) : null;
   const columns: ProfileColumn[] = dataset.columns.map((c) => {
     const base: ProfileColumn = { name: c.name, type: c.type, unit: c.unit };
     if (c.type === "category") {
@@ -429,6 +455,22 @@ export function buildProfile(dataset: Dataset): DatasetProfile {
         }
       }
       base.maxAbsZ = Number(maxAbsZ.toFixed(2));
+      if (times) {
+        const series = dataset.rows.map((r, i) => {
+          const v = r[c.name];
+          return { t: times[i] ?? null, value: typeof v === "number" ? v : null };
+        });
+        const ma = movingAverage(series);
+        let latest = -1;
+        series.forEach((p, i) => {
+          if (p.value !== null && p.t !== null && (latest === -1 || p.t >= series[latest]!.t!)) latest = i;
+        });
+        const point = latest >= 0 ? ma[latest] : undefined;
+        if (point && point.avg !== null) {
+          base.movingAvg1h = Number(point.avg.toFixed(3));
+          base.movingAvg1hCount = point.count;
+        }
+      }
     }
     return base;
   });
@@ -465,6 +507,7 @@ export function buildProfile(dataset: Dataset): DatasetProfile {
       first: dataset.rows.slice(0, 3).map(toLine),
       last: dataset.rows.slice(-3).map(toLine),
     },
+    ...(safety ? { safety: compactAssessment(safety) } : {}),
   };
 }
 

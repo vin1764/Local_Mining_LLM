@@ -30,14 +30,14 @@ Browser (React UI) ── http://127.0.0.1:8080 ──► Local app server (Node
 
 | | **Local app** (`npm start`) | **Web edition** (GitHub Pages) |
 | --- | --- | --- |
-| Where the AI runs | Ollama on your computer | Inside the visitor's browser (WebLLM + WebGPU) |
-| Model | `qwen2.5:1.5b` via Ollama | Qwen 2.5 1.5B Instruct (MLC build) |
-| Install needed | Node.js + Ollama | None, just open the link |
-| Works offline | Yes, after setup | The model works offline once downloaded; the page itself needs a connection to open |
-| Browser support | Any modern browser | Recent Chrome or Edge on a desktop/laptop with a GPU |
-| First run | `ollama pull` (~1 GB) | One-time model download (~1 GB) after the visitor clicks **Download** |
+| Where the AI runs | Ollama on your computer | **Preferred:** the local app (Ollama) on the visitor's computer, if it is running and allows the site. **Optional:** inside the browser (WebLLM + WebGPU) after the visitor chooses it |
+| Model | `qwen2.5:1.5b` via Ollama | Same via the local app; or Qwen 2.5 1.5B Instruct (MLC build) in the browser |
+| Install needed | Node.js + Ollama | None to view the dashboard; the local app for local AI |
+| Works offline | Yes, after setup | No, the page needs a connection to open |
+| Browser support | Any modern browser | Chrome or Edge recommended (see "Local AI from GitHub Pages") |
+| Without any AI | Charts, statistics and the rule-based safety status still work | Same |
 
-Both editions use the same dashboard, statistics, findings, severity rule and
+Both editions use the same dashboard, statistics, safety rules, findings and
 consistency checks (`src/lib/ai/analyst.ts`). Only the place the model runs differs.
 
 ### Web edition (GitHub Pages)
@@ -47,8 +47,13 @@ consistency checks (`src/lib/ai/analyst.ts`). Only the place the model runs diff
 - **Deploy:** `.github/workflows/pages.yml` builds and publishes the site on
   every push to `main`. One-time setup: in the GitHub repo, open
   **Settings → Pages** and set **Source** to **GitHub Actions**.
-- **Model download:** nothing large downloads until the visitor clicks
-  **DOWNLOAD MODEL & RUN ANALYSIS**. The model comes from WebLLM's model hosts
+- **AI source:** the page first looks for the local STRATA app at
+  `http://127.0.0.1:8080` (change with `VITE_LOCAL_AI_URL` at build time). If it
+  is not reachable, the AI Analyst shows **Local AI is not running** with the
+  start command, and offers the in-browser model as an alternative. There is no
+  cloud fallback.
+- **In-browser model download:** nothing large downloads until the visitor clicks
+  **USE IN-BROWSER MODEL INSTEAD**. The model comes from WebLLM's model hosts
   (Hugging Face and the `mlc-ai` GitHub repos) and is cached in that browser.
   The CSV and the statistics never leave the device.
 - **GPUs without 16-bit shader support** automatically get the `q4f32` build of
@@ -57,6 +62,41 @@ consistency checks (`src/lib/ai/analyst.ts`). Only the place the model runs diff
   prebuilt list when building, for example
   `VITE_WEBLLM_MODEL=Qwen2.5-3B-Instruct-q4f16_1-MLC npm run build:pages`.
 - **Saved runs** are stored in the visitor's browser for the site's address.
+
+### Local AI from GitHub Pages
+
+GitHub Pages only serves static files. It cannot run Node.js or Ollama. To use
+your local model from the hosted page:
+
+1. Install and build the local app (section 1), with Ollama running.
+2. Start it and allow the Pages site to call it:
+
+   ```powershell
+   npm run start:with-pages
+   ```
+
+   That is `npm start` plus `--allow-origin https://vin1764.github.io`. For a
+   fork, or for `npm run dev`, set `CORS_ALLOWED_ORIGINS=https://<user>.github.io`
+   in `.env` instead.
+3. Open https://vin1764.github.io/Local_Mining_LLM/ in **Chrome or Edge**. If the
+   browser asks to let the site access devices on your local network, allow it.
+   The badge then shows `LOCAL AI · QWEN2.5:1.5B`.
+
+How this stays safe:
+
+- The app still listens on `127.0.0.1` only, so other computers cannot reach it.
+- Only the exact origins you list may call `/api/local-ai/status` and
+  `/api/local-ai/analyze`. There is no `*` wildcard, and requests addressed to any
+  host other than localhost are refused.
+- The analyze route only accepts `application/json`, so other websites cannot
+  send it without a CORS preflight, which they fail. It answers Chrome's
+  Private Network Access preflight only for allowed origins.
+- The API only analyses a statistics profile. It is not a proxy and cannot read files.
+
+Browser limits: an HTTPS page calling `http://127.0.0.1` relies on the browser
+treating loopback as a secure address. Chrome and Edge do this. Firefox and
+Safari were not tested and may block the request; if so, use the local app at
+http://127.0.0.1:8080 directly.
 
 ## 1. One-time setup (needs internet)
 
@@ -128,7 +168,8 @@ npm run doctor -- --infer
    npm start
    ```
 
-3. Open **<http://127.0.0.1:8080>** in your browser.
+3. Open **<http://127.0.0.1:8080>** in your browser. To also serve the GitHub
+   Pages site, start with `npm run start:with-pages` instead (see above).
 4. Drop a CSV file onto the intake box, or click **LOAD DEMO ORE SAMPLE**.
 5. The AI analyst runs automatically. The header badge shows
    `LOCAL AI · QWEN2.5:1.5B` when the model is ready.
@@ -144,6 +185,8 @@ Stop the app with `Ctrl+C`.
 | `npm run dev` | Dev server with hot reload on http://127.0.0.1:8080 |
 | `npm run build` | Production build into `.output/` |
 | `npm start` | Run the production build on http://127.0.0.1:8080 |
+| `npm run start:with-pages` | Same, and let https://vin1764.github.io use this computer's local AI |
+| `npm run build:pages` | Static GitHub Pages build into `dist-pages/` |
 | `npm run doctor` | Check Node, dependencies, build, Ollama and the model (`-- --infer` also runs a test prompt) |
 | `npm run setup:model` | `ollama pull qwen2.5:1.5b` |
 | `npm test` | Unit tests (no Ollama needed) |
@@ -165,6 +208,8 @@ All settings are optional environment variables. Put them in `.env` (see
 | `HOST` | `127.0.0.1` | App listen address. Keep loopback. |
 | `PORT` | `8080` | App port. Saved runs belong to this exact address. |
 | `ALLOWED_HOSTS` | unset | Extra host names the app accepts (comma-separated). |
+| `CORS_ALLOWED_ORIGINS` | unset | Exact web origins allowed to call the local AI API, e.g. `https://vin1764.github.io` (comma-separated, no wildcard). |
+| `VITE_LOCAL_AI_URL` | `http://127.0.0.1:8080` | Pages build only: where the hosted page looks for the local app. |
 
 No API keys are needed. `LOVABLE_API_KEY` is no longer used.
 
@@ -205,9 +250,91 @@ Small models misquote numbers, so the work is split:
    once. If the summary is still wrong, the headline and summary are written from
    the statistics instead, and the panel says so.
 
-No safety thresholds are configured in this app, and the model is told not to
-invent any. The report is a statistical read of the uploaded file, not a
-certified safety determination.
+The system prompt is in **`src/lib/ai/prompts.ts`** (`MINING_SYSTEM_PROMPT`).
+`buildSystemPrompt()` adds this file's sensor names, units and configured
+thresholds, and the facts sheet adds the safety assessment and each
+parameter's latest value against its 1-hour moving average.
+
+## 5a. Safety classification
+
+Every analysis shows a safety status first, before the AI text:
+
+| Status | Meaning |
+| --- | --- |
+| **UNSAFE** (red, ✕ shield) | A configured **critical** limit is breached by a valid reading in the current window |
+| **INSUFFICIENT DATA** (grey, ? shield) | No applicable verified thresholds, a required parameter is missing, readings are stale, invalid or conflicting, or the data is not current |
+| **CAUTION** (amber, ! shield) | A **warning** limit is breached, a critical breach happened earlier in the file, an abnormal reading (abs z ≥ 3) needs verification, or sensors disagree |
+| **SAFE** (green, ✓ shield) | Every applicable configured check passed on adequate, current data. **Not a certification that the mine is safe.** |
+
+- **Deterministic.** The status comes from `assessSafety()` in
+  `src/lib/safety/assess.ts`, never from the model. Priority: UNSAFE, then
+  INSUFFICIENT DATA, then CAUTION, then SAFE.
+- **Current window** = readings in the last 60 minutes of the file. SAFE also
+  requires the newest reading to be at most 60 minutes old by the clock, so
+  historical files can never be SAFE. Settings are in `ASSESSMENT_SETTINGS`.
+- **The model explains, it does not decide.** It must repeat the status. If it
+  reports a different status, calls conditions "safe" when they are not, says
+  "the mine is safe" at all, or reports a breach the rules did not find, the app
+  retries once. If that fails, it keeps the rule-based status and marks the AI
+  text **needs review**.
+- **Works without AI.** The status, evidence, measurements and rule-based next
+  actions are shown even when no model is available.
+
+### Thresholds (none are shipped)
+
+The app ships with **no thresholds**, because it must not guess your site's legal
+or engineering limits. Until you add verified ones, every analysis is
+**INSUFFICIENT DATA**. Add them in either place:
+
+1. **In code:** `src/config/safety-rules.ts` (`SAFETY_RULES`). Applies to every user.
+2. **In the app:** **LOAD SITE THRESHOLDS (JSON)** in the safety panel. This is
+   stored in that browser only, and replaces the code rules while loaded.
+
+Format (take every number from your regulator or site standard, and cite it in `source`):
+
+```text
+{
+  "version": 1,
+  "name": "Site standard rev 3",
+  "rules": [
+    {
+      "id": "methane",
+      "label": "Methane",
+      "columns": ["methane_pct"],         // CSV column names (case-insensitive)
+      "unit": "%",
+      "direction": "above",               // "above" = higher is worse, "below" = lower is worse
+      "warning": <number>,                // optional
+      "critical": <number>,
+      "source": "<regulation / site standard, clause>",
+      "required": true,                   // file without this parameter cannot be SAFE
+      "maxStalenessMinutes": <number>,    // optional, default 60
+      "validRange": [<min>, <max>]        // optional, readings outside are invalid
+    }
+  ]
+}
+```
+
+(The comments are for explanation only; the real file must be plain JSON.)
+Invalid files are rejected with a message. Warning must be on the safe side of
+critical, and every rule needs a `source`.
+
+## 5b. One-hour moving average
+
+The Parameter Deck plots each parameter with a dashed **1-hour moving average**
+(`src/lib/moving-average.ts`). It was previously a 7-row average labelled "7-DAY".
+
+- **Rolling (trailing) mean by time.** For each reading at time *t*, it averages
+  every valid reading of that parameter with a timestamp in (*t* − 60 min, *t*].
+  A reading exactly 60 minutes earlier is outside the window.
+- **Timestamps, not row counts,** decide the window, so irregular sampling and
+  gaps are handled correctly. Rows are sorted by time first.
+- **Missing or invalid values** are left out. The old version counted them as 0.
+  A window with no valid readings has no average, which shows as a gap.
+- **No time column:** there is no 1-hour window, so the chart says
+  `1-HOUR MA N/A (NO TIME COLUMN)`.
+- **Sparse data:** when readings are an hour or more apart (like the daily demo
+  data), each window holds one reading, so the average equals the reading. The
+  chart says `1-HOUR MA · ≤1 READING/HOUR`.
 
 ## 6. Privacy and security
 
@@ -282,8 +409,17 @@ npm registry. Neither is used at runtime.
 - **Consistency checks are heuristic:** they catch wrong directions and invented
   numbers. They cannot catch every mistake, for example a real date attached to
   the wrong value.
-- **No safety thresholds:** severities are statistical only. Adding verified
-  site limits would need a configuration file and code changes.
+- **No safety thresholds are shipped.** Without verified thresholds every
+  analysis is INSUFFICIENT DATA (see section 5a). Severities on the statistical
+  findings are trend/outlier ratings, not safety limits.
+- **AI wording can misattribute.** The safety checks catch a wrong status, "safe"
+  claims and breach claims under a non-UNSAFE status, but not every slip. For
+  example, under UNSAFE the model once wrote that "methane and CO2" exceeded
+  critical limits when only methane had a limit. The rule-based evidence table
+  is authoritative.
+- **Column typing quirk (existing):** a numeric column whose values are all
+  negative (e.g. `-5`) is detected as a time column, so it is not assessed. For a
+  required parameter this gives INSUFFICIENT DATA, never SAFE.
 - **Saved runs are per browser and address** (IndexedDB), not a shared database.
 - **Lint:** `npm run lint` reported ~790 Prettier formatting errors in the original
   code before this migration. New files are formatted; old files were left as they
@@ -291,6 +427,43 @@ npm registry. Neither is used at runtime.
 - **Not tested on Windows:** see the test results below.
 
 ## 10. Test results
+
+### Mining safety update (latest)
+
+Tested in the same Linux container with Ollama 0.40.11 and `qwen2.5:1.5b`.
+
+**Passed**
+
+- `npm test`: 94 unit tests, including 11 for the 1-hour moving average (a full
+  hour, several hours, the 60-minute boundary, missing/invalid values, unsorted
+  and irregular timestamps, empty data), 16 for the safety engine (each status,
+  priority order, missing/stale/invalid/conflicting data, old data, no time
+  column, thresholds file validation), 16 for the AI prompt and safety guard
+  (mining prompt and sensor context sent, model cannot override the status,
+  review flags, malformed output) and 8 for the local AI API (CORS allowlist,
+  preflight, Host check, JSON-only, size limit).
+- `npm run build` and `npm run build:pages` (relative `./assets/` paths for the
+  `/Local_Mining_LLM/` sub-path; no server code in the Pages bundle).
+- Local app in Chromium with real Ollama: demo data gives INSUFFICIENT DATA before
+  any AI runs, with 1-hour MA labels and no "7-DAY" text left. After loading a
+  test thresholds file (fixture values, not real limits), a CSV with a critical
+  reading gives UNSAFE, with the measurement table, AI explanation and exported
+  report all showing it, and a CSV within limits gives SAFE with the
+  "not a certification" note. No request left 127.0.0.1.
+- Pages build served from a different origin under `/Local_Mining_LLM/`: assets
+  and charts load. With the local app not allowing the origin, the badge says
+  `LOCAL AI NOT RUNNING`, the panel shows the start command, and no analysis is
+  invented. With `--allow-origin`, the analysis came from the local Ollama app.
+- `npm run dev`: the local API answers the allowed origin (including the
+  private-network preflight) and refuses others.
+
+**Not verified**
+
+- Windows, and browsers other than Chromium.
+- Chrome's local-network permission prompt in a normal (non-headless) browser.
+- Real site thresholds or real mine data.
+
+### Earlier releases
 
 Tested in a Linux container (4 CPU cores, no GPU) with Node.js 22.22, npm
 10.9.4, Ollama 0.40.11 and `qwen2.5:1.5b` (986 MB, pulled from the official
@@ -332,6 +505,24 @@ Ollama library).
 - Real mine-site data, and judging whether the model's explanations are useful.
 
 ## 11. Files changed
+
+### Mining safety update
+
+Added: `src/lib/moving-average.ts`, `src/lib/safety/assess.ts`,
+`src/lib/safety/rules.ts`, `src/lib/safety/store.ts`,
+`src/config/safety-rules.ts`, `src/lib/ai/prompts.ts`,
+`src/lib/local-api.server.ts`, `src/components/safety-panel.tsx`, and tests
+`moving-average`, `safety`, `ai-safety`, `local-api`.
+
+Changed: `src/components/charts.tsx` (1-hour MA), `src/lib/dataset.ts` (chart
+order helper, MA and safety in the profile, safety in insights),
+`src/lib/ai/insights.ts` (facts, schema, safety checks), `src/lib/ai/analyst.ts`
+(mining prompt, retry on safety conflict), `src/lib/ai/client.browser.ts` (local
+app first), `src/lib/ai/provider.ts`, `src/lib/report.ts`, `src/routes/index.tsx`,
+`src/server.ts`, `scripts/start.mjs` (`--allow-origin`), `vite.config.ts`
+(`cors: false`), `package.json`, tests `analysis` and `browser-client`.
+
+### Earlier releases
 
 Added:
 

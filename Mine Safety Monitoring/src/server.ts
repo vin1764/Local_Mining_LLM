@@ -2,6 +2,7 @@ import "./lib/error-capture";
 
 import { consumeLastCapturedError } from "./lib/error-capture";
 import { renderErrorPage } from "./lib/error-page";
+import { handleLocalApi, LOCAL_API_PREFIX } from "./lib/local-api.server";
 
 type ServerEntry = {
   fetch: (request: Request, env: unknown, ctx: unknown) => Promise<Response> | Response;
@@ -47,6 +48,15 @@ function isH3SwallowedErrorBody(body: string): boolean {
 export default {
   async fetch(request: Request, env: unknown, ctx: unknown) {
     try {
+      // JSON API used by the GitHub Pages edition to reach the local AI.
+      if (new URL(request.url).pathname.startsWith(LOCAL_API_PREFIX)) {
+        const { runLocalAnalysis, getLocalAiStatus } = await import("./lib/ai/analyst.server");
+        const res = await handleLocalApi(request, {
+          analyze: (input, signal) => runLocalAnalysis(input, { signal }),
+          status: () => getLocalAiStatus(),
+        });
+        if (res) return res;
+      }
       const handler = await getServerEntry();
       const response = await handler.fetch(request, env, ctx);
       return await normalizeCatastrophicSsrResponse(response);

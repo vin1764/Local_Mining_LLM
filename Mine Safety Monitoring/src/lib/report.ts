@@ -1,10 +1,16 @@
 import { prettyName, type Dataset, type DatasetInsights } from "@/lib/dataset";
+import {
+  SAFETY_STATUS_LABEL,
+  type SafetyAssessment,
+} from "@/lib/safety/assess";
 
 export interface AnalysisRecord {
   insights: DatasetInsights;
   model: string;
   analysedAt: string; // ISO timestamp
   durationMs?: number;
+  /** "ollama" (local app) or "webllm" (in the browser). */
+  provider?: string;
   /** "code" when the headline/summary were written from statistics instead of the model. */
   summarySource?: "model" | "code";
 }
@@ -17,8 +23,60 @@ export const AI_DISCLAIMER =
 export function buildMarkdownReport(
   dataset: Dataset,
   analysis: AnalysisRecord,
+  assessment?: SafetyAssessment,
 ): string {
   const { insights } = analysis;
+  const safetyLines: string[] = [];
+  if (assessment) {
+    safetyLines.push(
+      `## Safety status: ${SAFETY_STATUS_LABEL[assessment.status]}`,
+      "",
+      `_Rule-based classification of readings up to ${assessment.dataAsOf ?? "—"} (thresholds: ${assessment.rulesSource})._`,
+      "",
+      ...assessment.reasons.map((r) => `- ${r}`),
+      "",
+    );
+    if (assessment.evaluations.length) {
+      safetyLines.push(
+        "| Parameter | Check | Latest | 1-hour moving average | Worst (last 60 min) | Warning | Critical | Source |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        ...assessment.evaluations.map((e) => {
+          const op = e.direction === "above" ? "≥" : "≤";
+          const v = (x: number | null) =>
+            x === null ? "—" : `${x} ${e.unit}`.trim();
+          return `| ${e.column} | ${e.level.toUpperCase()} | ${v(e.latestValue)} | ${v(e.movingAvg1h)} | ${v(e.worstValue)} | ${e.warning === null ? "—" : `${op} ${e.warning} ${e.unit}`} | ${op} ${e.critical} ${e.unit} | ${e.source} |`;
+        }),
+        "",
+      );
+    }
+    if (insights.safety?.explanation) {
+      safetyLines.push(
+        `**AI explanation:** ${insights.safety.explanation}`,
+        "",
+      );
+      if (insights.safety.needsReview)
+        safetyLines.push(
+          `> ⚠ ${insights.safety.reviewReason ?? "The AI wording needs review."}`,
+          "",
+        );
+    }
+    if (assessment.nextActions.length) {
+      safetyLines.push(
+        "**Rule-based next actions:**",
+        "",
+        ...assessment.nextActions.map((a) => `- ${a}`),
+        "",
+      );
+    }
+    if (assessment.dataQualityNotes.length) {
+      safetyLines.push(
+        "**Data quality:**",
+        "",
+        ...assessment.dataQualityNotes.map((n) => `- ${n}`),
+        "",
+      );
+    }
+  }
   const lines = [
     `# ${insights.headline}`,
     "",
@@ -27,6 +85,7 @@ export function buildMarkdownReport(
     `- **Model:** ${analysis.model} (ran on this device)`,
     `- **Analysed:** ${new Date(analysis.analysedAt).toLocaleString()}`,
     "",
+    ...safetyLines,
     "## Summary",
     "",
     insights.summary,

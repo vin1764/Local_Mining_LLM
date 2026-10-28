@@ -10,6 +10,8 @@
  *   finding and the recommendations.
  * - Model text that contradicts the computed direction of a trend is
  *   rejected; if it keeps happening, code writes the summary instead.
+ * - The safety status comes from the rule-based assessment (lib/safety).
+ *   The model only explains it; wording that disagrees is flagged for review.
  */
 import { z } from "zod";
 
@@ -18,6 +20,8 @@ import type {
   DatasetProfile,
   ProfileColumn,
 } from "@/lib/dataset";
+import type { SafetyStatus } from "@/lib/safety/assess";
+import { safetyFacts } from "./prompts";
 
 type Severity = DatasetInsights["findings"][number]["severity"];
 
@@ -25,6 +29,46 @@ type Severity = DatasetInsights["findings"][number]["severity"];
 
 const finite = z.number().finite();
 const shortText = z.string().max(300);
+
+const nullableFinite = finite.nullable();
+const safetySchema = z.object({
+  status: z.enum(["SAFE", "CAUTION", "UNSAFE", "INSUFFICIENT_DATA"]),
+  reasons: z.array(z.string().max(400)).max(20),
+  evaluations: z
+    .array(
+      z.object({
+        ruleId: shortText,
+        label: shortText,
+        column: shortText,
+        unit: z.string().max(20),
+        direction: z.enum(["above", "below"]),
+        warning: nullableFinite,
+        critical: finite,
+        source: shortText,
+        level: z.enum([
+          "ok",
+          "warning",
+          "critical",
+          "no_data",
+          "stale",
+          "invalid",
+        ]),
+        latestValue: nullableFinite,
+        latestAt: shortText.nullable(),
+        worstValue: nullableFinite,
+        worstAt: shortText.nullable(),
+        movingAvg1h: nullableFinite,
+        explanation: z.string().max(400),
+      }),
+    )
+    .max(20),
+  dataQualityNotes: z.array(z.string().max(400)).max(20),
+  nextActions: z.array(z.string().max(400)).max(20).default([]),
+  unassessedParameters: z.array(shortText).max(50),
+  dataAsOf: shortText.nullable(),
+  rulesSource: shortText,
+  ruleCount: z.number().int().nonnegative(),
+});
 
 export const profileSchema = z.object({
   name: z.string().min(1).max(260),
@@ -47,6 +91,8 @@ export const profileSchema = z.object({
         missingPct: finite.optional(),
         anomalyCount: z.number().int().nonnegative().optional(),
         maxAbsZ: finite.optional(),
+        movingAvg1h: finite.optional(),
+        movingAvg1hCount: z.number().int().nonnegative().optional(),
         distinct: z.number().int().nonnegative().optional(),
       }),
     )
@@ -69,6 +115,7 @@ export const profileSchema = z.object({
     first: z.array(z.string().max(4000)).max(10),
     last: z.array(z.string().max(4000)).max(10),
   }),
+  safety: safetySchema.optional(),
 });
 
 /* ============================ Deterministic findings ============================ */
@@ -208,21 +255,7 @@ export function fallbackSummary(
 
 /* ============================ Prompt ============================ */
 
-export const SYSTEM_INSTRUCTIONS = [
-  "You are STRATA's mine-data analyst: a careful mining engineer writing a short shift report.",
-  "You receive a FACTS sheet computed by software from one CSV file. It is the only evidence you have.",
-  "Rules:",
-  "- Use only numbers that appear in the FACTS sheet. Never invent values, limits, thresholds or units.",
-  "- Copy directions exactly: if FACTS says a parameter ROSE, never say it fell, and the reverse.",
-  "- Name parameters exactly as written in the FACTS sheet (for example ore_grade_pct). Do not guess what abbreviations stand for.",
-  "- Only outliers have dates. Do not attach dates to minimums, maximums or means.",
-  "- Keep units and the time period when you quote a number.",
-  "- Measured facts are already written for you. Notes must not repeat numbers: give a possible explanation or what to check, starting with 'May', 'Possibly' or 'Could'.",
-  "- Correlation is not causation. Never claim one parameter causes another.",
-  "- No safety limits were provided, so never say a value breaches a limit or is unsafe.",
-  "- If the evidence is too thin for a conclusion, say so.",
-  "Write clear, direct English like a daily shift report. No fluff.",
-].join("\n");
+// The system prompt lives in ./prompts.ts (MINING_SYSTEM_PROMPT / buildSystemPrompt).
 
 function rankColumns(columns: ProfileColumn[]): {
   kept: ProfileColumn[];
@@ -265,7 +298,14 @@ export function buildFactsSheet(profile: DatasetProfile): string {
   for (const c of kept) {
     const dir = direction(c.trendPct).toUpperCase();
     const unit = c.unit ? `unit ${c.unit}` : "unit not stated";
-    lines.push(`- ${c.name} (${unit}): ${dir}. ${describeColumn(c, profile)}`);
+    let ma = "";
+    if (c.movingAvg1h !== undefined && c.last !== undefined) {
+      const diff = c.last - c.movingAvg1h;
+      ma = ` Latest ${withUnit(c.last, c.unit)}; 1-hour moving average ${withUnit(c.movingAvg1h, c.unit)} over ${c.movingAvg1hCount ?? "?"} reading(s); latest is ${diff === 0 ? "equal to" : `${num(Math.abs(diff))} ${diff > 0 ? "above" : "below"}`} it.`;
+    }
+    lines.push(
+      `- ${c.name} (${unit}): ${dir}. ${describeColumn(c, profile)}${ma}`,
+    );
   }
   if (omitted.length > 0) {
     lines.push(
@@ -297,7 +337,7 @@ export function buildFactsSheet(profile: DatasetProfile): string {
   }
 
   lines.push("");
-  lines.push("SAFETY THRESHOLDS: none provided for any parameter.");
+  lines.push(safetyFacts(profile));
   return lines.join("\n");
 }
 
@@ -316,6 +356,8 @@ export function buildUserPrompt(
     "- summary: 2 to 4 sentences on the period and the main movements, directions copied from FACTS.",
     "- notes: for each finding parameter, one short sentence with a possible explanation or what to check, without numbers. Start with May, Possibly or Could.",
     "- recommendations: 2 to 5 short, concrete checks for the next shift.",
+    `- safety_status: exactly "${profile.safety?.status ?? "INSUFFICIENT_DATA"}" (copied from SAFETY ASSESSMENT).`,
+    "- safety_explanation: 1 to 3 sentences explaining that status from the SAFETY ASSESSMENT evidence.",
   ].join("\n");
 }
 
@@ -334,8 +376,20 @@ export const insightsJsonSchema = {
       },
     },
     recommendations: { type: "array", items: { type: "string" } },
+    safety_status: {
+      type: "string",
+      enum: ["SAFE", "CAUTION", "UNSAFE", "INSUFFICIENT_DATA"],
+    },
+    safety_explanation: { type: "string" },
   },
-  required: ["headline", "summary", "notes", "recommendations"],
+  required: [
+    "headline",
+    "summary",
+    "notes",
+    "recommendations",
+    "safety_status",
+    "safety_explanation",
+  ],
 } as const;
 
 // Lenient on purpose: small models wobble on casing and extra fields.
@@ -348,6 +402,9 @@ const rawModelSchema = z.object({
   recommendations: z
     .array(z.union([z.string(), z.object({}).passthrough()]))
     .default([]),
+  // Optional and loosely typed: a missing or odd value is a review flag, not a failure.
+  safety_status: z.unknown().optional(),
+  safety_explanation: z.unknown().optional(),
 });
 
 /* ============================ Consistency checks ============================ */
@@ -472,6 +529,61 @@ export function findUngroundedNumbers(
   return bad;
 }
 
+const NEGATION =
+  /\b(not|no|cannot|can't|isn't|aren't|unable|insufficient|unconfirmed|without|nor|never)\b/i;
+const HEDGE = /\b(may|might|could|possibly|potential(ly)?|if)\b/i;
+// "The mine is safe" overclaims under any status: sensor checks cannot establish it.
+const OVERCLAIM_SAFE =
+  /\b(mine|site|area|conditions?|operations?|environment|workplace|workings?|it)\s+(is|are|was|were|remains?|appears?|seems?)\s+(to be\s+)?(completely\s+|fully\s+|totally\s+|entirely\s+)?safe\b/i;
+const CERTIFIED_SAFE =
+  /\bcertif\w*\b[^.]*\bsafe\b|\bsafe to (enter|work|operate|proceed)\b/i;
+const CLAIMS_UNSAFE =
+  /\bunsafe\b|\bbreach(es|ed)?\b|\bexceed(s|ed)? (the )?(critical |warning |safety )?(limit|threshold)s?\b|\bdanger(ous)?\b/i;
+
+/**
+ * Does model text claim a safety state the rule-based status does not
+ * support? Returns a short reason, or null when the text is consistent.
+ */
+export function findSafetyClaimConflict(
+  text: string,
+  status: SafetyStatus,
+): string | null {
+  const clauses = text
+    .split(/[.;!?]|\bbut\b|\bhowever\b/i)
+    .map((c) => c.trim())
+    .filter(Boolean);
+  for (const c of clauses) {
+    if (CERTIFIED_SAFE.test(c) && !NEGATION.test(c)) {
+      return "it claims conditions are certified or safe to enter, which sensor data cannot establish";
+    }
+    if (OVERCLAIM_SAFE.test(c) && !NEGATION.test(c) && !HEDGE.test(c)) {
+      return "it states that the mine or conditions are safe, which sensor checks alone cannot establish";
+    }
+    // "safety" alone (e.g. "safety status") is not a claim; look for "safe".
+    const saysSafe =
+      /(^|[^a-z])safe(?![a-z])/i.test(c) ||
+      /\bno (safety )?(hazards?|concerns|risks?)\b|\ball clear\b/i.test(c);
+    if (
+      status !== "SAFE" &&
+      saysSafe &&
+      !/\bunsafe\b/i.test(c) &&
+      !NEGATION.test(c) &&
+      !HEDGE.test(c)
+    ) {
+      return `it describes conditions as safe while the rule-based status is ${status}`;
+    }
+    if (
+      status !== "UNSAFE" &&
+      CLAIMS_UNSAFE.test(c) &&
+      !NEGATION.test(c) &&
+      !HEDGE.test(c)
+    ) {
+      return `it reports a hazard or limit breach while the rule-based status is ${status}`;
+    }
+  }
+  return null;
+}
+
 function clip(s: string, max: number): string {
   const t = s.replace(/\s+/g, " ").trim();
   return t.length > max ? `${t.slice(0, max - 1).trimEnd()}…` : t;
@@ -481,6 +593,8 @@ export interface NormaliseOutcome {
   insights: DatasetInsights;
   /** Model sentences dropped for contradicting the data or naming unknown parameters. */
   droppedItems: number;
+  /** Why the wording conflicts with the rule-based safety status (null if it doesn't). */
+  safetyConflict: string | null;
   /** Headline/summary contradicted the data or quoted a number not in the facts. */
   summaryContradicted: boolean;
 }
@@ -498,6 +612,9 @@ export function normaliseInsights(
   if (!parsed.success) return null;
   const raw = parsed.data;
   let dropped = 0;
+  const status: SafetyStatus = profile.safety?.status ?? "INSUFFICIENT_DATA";
+  const claimConflict = (t: string) =>
+    findSafetyClaimConflict(t, status) !== null;
   const allowed = allowedNumbers(profile);
   const grounded = (text: string) =>
     findUngroundedNumbers(text, allowed).length === 0;
@@ -513,7 +630,8 @@ export function normaliseInsights(
     }
     if (
       findDirectionContradictions(note, profile, "descriptive").length > 0 ||
-      !grounded(note)
+      !grounded(note) ||
+      claimConflict(note)
     ) {
       dropped++;
       continue;
@@ -539,7 +657,8 @@ export function normaliseInsights(
       if (!r) return false;
       if (
         findDirectionContradictions(r, profile, "descriptive").length > 0 ||
-        !grounded(r)
+        !grounded(r) ||
+        claimConflict(r)
       ) {
         dropped++;
         return false;
@@ -556,9 +675,47 @@ export function normaliseInsights(
     findDirectionContradictions(summaryText, profile).length > 0 ||
     !grounded(summaryText);
 
+  // Safety: the status is the rule-based one. The model's wording is kept
+  // only if it agrees; otherwise it is shown with a "needs review" flag.
+  let explanation =
+    typeof raw.safety_explanation === "string"
+      ? clip(raw.safety_explanation, 800)
+      : "";
+  if (explanation && !grounded(explanation)) {
+    explanation = "";
+    dropped++;
+  }
+  const modelStatus =
+    typeof raw.safety_status === "string"
+      ? raw.safety_status.trim().toUpperCase().replace(/\s+/g, "_")
+      : "";
+  let safetyConflict: string | null = null;
+  if (modelStatus && modelStatus !== status) {
+    safetyConflict = `the model reported ${modelStatus} but the rule-based status is ${status}`;
+  } else {
+    safetyConflict = findSafetyClaimConflict(
+      `${headline}. ${summary}. ${explanation}`,
+      status,
+    );
+  }
+
   return {
-    insights: { headline, summary, findings, recommendations },
+    insights: {
+      headline,
+      summary,
+      findings,
+      recommendations,
+      safety: {
+        status,
+        ...(explanation ? { explanation } : {}),
+        needsReview: safetyConflict !== null,
+        ...(safetyConflict
+          ? { reviewReason: `The AI wording needs review: ${safetyConflict}.` }
+          : {}),
+      },
+    },
     droppedItems: dropped,
     summaryContradicted,
+    safetyConflict,
   };
 }

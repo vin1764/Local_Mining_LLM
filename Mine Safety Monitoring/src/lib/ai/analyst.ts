@@ -1,15 +1,16 @@
 import type { DatasetProfile } from "@/lib/dataset";
 import { ConfigError } from "./config-error";
 import {
-  SYSTEM_INSTRUCTIONS,
   buildUserPrompt,
   fallbackSummary,
+  findSafetyClaimConflict,
   insightsJsonSchema,
   normaliseInsights,
   planFindings,
   profileSchema,
   type NormaliseOutcome,
 } from "./insights";
+import { buildSystemPrompt } from "./prompts";
 import { LocalAiError, type LocalInferenceProvider } from "./provider";
 import type { AnalyzeResult } from "./types";
 
@@ -57,6 +58,10 @@ function log(event: string, fields: Record<string, string | number | boolean>) {
  * validate → plan code-written findings → prompt → check → retry/fallback.
  * Used by the Ollama server and by the in-browser (WebLLM) build.
  */
+/** Lower is better: safety conflicts matter most, then direction contradictions. */
+const score = (n: NormaliseOutcome) =>
+  (n.safetyConflict ? 2 : 0) + (n.summaryContradicted ? 1 : 0);
+
 export async function runAnalysis(
   input: unknown,
   options: {
@@ -99,6 +104,7 @@ export async function runAnalysis(
     };
   }
   const prompt = buildUserPrompt(profile, planned);
+  const system = buildSystemPrompt(profile);
   let totalMs = 0;
   let lastError: unknown = null;
   let best: NormaliseOutcome | null = null;
@@ -109,7 +115,7 @@ export async function runAnalysis(
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const result = await provider.generateStructured({
-        system: SYSTEM_INSTRUCTIONS,
+        system,
         prompt,
         jsonSchema: insightsJsonSchema,
         ...(signal ? { signal } : {}),
@@ -126,9 +132,13 @@ export async function runAnalysis(
         );
         continue;
       }
-      best = normalised;
-      if (!normalised.summaryContradicted) break;
-      log("summary_contradicted", { model, attempt });
+      // Prefer an answer without safety conflicts, then without contradictions.
+      if (!best || score(normalised) < score(best)) best = normalised;
+      if (!normalised.summaryContradicted && !normalised.safetyConflict) break;
+      log(
+        normalised.safetyConflict ? "safety_conflict" : "summary_contradicted",
+        { model, attempt },
+      );
     } catch (error) {
       const code = error instanceof LocalAiError ? error.code : "unknown";
       log("error", { code, attempt });
@@ -154,12 +164,34 @@ export async function runAnalysis(
   if (best.summaryContradicted) {
     insights = { ...insights, ...fallbackSummary(profile, planned) };
     summarySource = "code";
+    // The model's headline/summary are gone; re-check only what is still shown.
+    const safety = insights.safety!;
+    if (
+      safety.needsReview &&
+      !best.safetyConflict?.startsWith("the model reported")
+    ) {
+      const conflict = safety.explanation
+        ? findSafetyClaimConflict(safety.explanation, safety.status)
+        : null;
+      insights = {
+        ...insights,
+        safety: {
+          status: safety.status,
+          ...(safety.explanation ? { explanation: safety.explanation } : {}),
+          needsReview: conflict !== null,
+          ...(conflict
+            ? { reviewReason: `The AI wording needs review: ${conflict}.` }
+            : {}),
+        },
+      };
+    }
   }
   log("ok", {
     model,
     ms: totalMs,
     dropped: best.droppedItems,
     summary: summarySource,
+    review: insights.safety?.needsReview ?? false,
   });
   return {
     ok: true,

@@ -16,6 +16,9 @@ import {
 
 import { UploadZone } from "@/components/upload-zone";
 import { SavedRunsPanel } from "@/components/saved-runs";
+import { SafetyPanel, SafetyStatusBadge } from "@/components/safety-panel";
+import { assessSafety, SAFETY_STATUS_LABEL, type SafetyAssessment } from "@/lib/safety/assess";
+import { useActiveRules } from "@/lib/safety/store";
 import { EmptyChartNote, MiniChart, SectionHeader, TrendConsole } from "@/components/charts";
 import {
   buildDataset,
@@ -104,7 +107,7 @@ function AiStatusBadge() {
   const status = useAiStatus();
   const s = status.data;
   const ready = !!s?.reachable && !!s?.modelInstalled;
-  const browser = aiClient.mode === "browser";
+  const browser = s?.provider === "webllm";
   const modelName = (s?.model ?? "").replace(/-q\d.*$/i, "").replace(/-Instruct$/i, "");
   const label = status.isPending
     ? "CHECKING LOCAL AI"
@@ -114,6 +117,8 @@ function AiStatusBadge() {
         ? "BROWSER AI UNSUPPORTED"
         : s?.reachable
           ? "MODEL NOT DOWNLOADED"
+          : s?.localBackendMissing
+            ? "LOCAL AI NOT RUNNING"
           : "LOCAL AI OFFLINE";
   return (
     <span
@@ -153,11 +158,14 @@ function useModelProgress(): LoadProgress | null {
 
 function AnalystPanel({
   dataset,
+  assessment,
   analysis,
   runKey,
   onAnalysis,
 }: {
   dataset: Dataset | null;
+  /** Rule-based safety classification for this dataset (sent to the model to explain). */
+  assessment: SafetyAssessment | null;
   analysis: AnalysisRecord | null;
   /** Increments whenever a fresh automatic run should start. */
   runKey: number;
@@ -166,8 +174,11 @@ function AnalystPanel({
   const abortRef = useRef<AbortController | null>(null);
   const queryClient = useQueryClient();
   const progress = useModelProgress();
+  const aiStatus = useAiStatus();
   const datasetRef = useRef(dataset);
   datasetRef.current = dataset;
+  const assessmentRef = useRef(assessment);
+  assessmentRef.current = assessment;
 
   const run = useMutation({
     mutationFn: async ({ profile }: { profile: DatasetProfile; dataset: Dataset }) => {
@@ -182,6 +193,7 @@ function AnalystPanel({
         analysedAt: new Date().toISOString(),
         durationMs: res.meta.durationMs,
         summarySource: res.meta.summarySource,
+        provider: res.meta.provider,
       } satisfies AnalysisRecord;
     },
     onSettled: () => {
@@ -193,7 +205,8 @@ function AnalystPanel({
     },
   });
 
-  const start = (d: Dataset) => run.mutate({ profile: buildProfile(d), dataset: d });
+  const start = (d: Dataset) =>
+    run.mutate({ profile: buildProfile(d, assessmentRef.current ?? undefined), dataset: d });
 
   // A new dataset cancels any analysis still running for the old one.
   useEffect(() => {
@@ -226,6 +239,9 @@ function AnalystPanel({
         <Cpu className="mx-auto size-7 text-primary" />
         <p className="mt-2 font-mono text-xs tracking-wider text-primary status-blink">
           PROCESSING {dataset.rowCount} ROWS × {dataset.numericNames.length} PARAMETERS…
+        </p>
+        <p className="mt-1 font-mono text-[10px] text-muted-foreground">
+          The safety classification above is rule-based and up to date · the AI explanation is being generated
         </p>
         {progress ? (
           <div className="mx-auto mt-3 max-w-md">
@@ -271,7 +287,7 @@ function AnalystPanel({
     const err = run.error;
     const hint = err instanceof AnalystError ? err.hint : undefined;
     const code = err instanceof AnalystError ? err.code : undefined;
-    if (code === "consent_required" || code === "unsupported") {
+    if (code === "consent_required" || code === "unsupported" || code === "backend_unavailable") {
       return (
         <div className="rounded-md border border-primary/40 bg-surface px-5 py-6">
           <p className="flex items-center gap-2 font-mono text-xs text-primary">
@@ -279,6 +295,26 @@ function AnalystPanel({
             {err.message}
           </p>
           {hint && <p className="mt-2 text-xs leading-relaxed text-foreground">{hint}</p>}
+          {code === "backend_unavailable" && (
+            <div className="mt-3 flex flex-wrap gap-2">
+              {rerunButton("RETRY WITH LOCAL AI")}
+              {aiStatus.data?.browserModelAvailable && (
+                <button
+                  onClick={() => {
+                    aiClient.allowDownload?.();
+                    start(dataset);
+                  }}
+                  className="flex items-center gap-2 rounded-sm border border-border bg-surface px-3 py-1.5 font-mono text-[11px] tracking-wider text-foreground transition-colors hover:border-primary/60"
+                >
+                  <Download className="size-3.5" />
+                  USE IN-BROWSER MODEL INSTEAD (~1 GB DOWNLOAD)
+                </button>
+              )}
+            </div>
+          )}
+          <p className="mt-3 font-mono text-[10px] text-muted-foreground">
+            The rule-based safety classification above does not need the AI and is still valid.
+          </p>
           {code === "consent_required" && (
             <button
               onClick={() => {
@@ -319,9 +355,41 @@ function AnalystPanel({
   }
 
   const { insights } = analysis;
+  const aiSafety = insights.safety;
+  const statusChanged = !!aiSafety && !!assessment && aiSafety.status !== assessment.status;
 
   return (
     <div className="grid gap-3">
+      <div className="rounded-md border border-border bg-surface p-4">
+        <div className="flex flex-wrap items-center gap-2">
+          <p className="font-mono text-[10px] tracking-wider text-primary">AI EXPLANATION OF THE SAFETY STATUS</p>
+          {aiSafety && <SafetyStatusBadge status={aiSafety.status} size="sm" />}
+        </div>
+        {!aiSafety ? (
+          <p className="mt-1.5 text-xs text-muted-foreground">
+            This saved analysis was made before safety classification was added. Re-run it for an explanation.
+          </p>
+        ) : (
+          <>
+            <p className="mt-1.5 text-sm leading-relaxed break-words text-foreground">
+              {aiSafety.explanation ?? "The model did not provide a usable explanation. Rely on the rule-based evidence above."}
+            </p>
+            {(aiSafety.needsReview || statusChanged) && (
+              <p
+                role="alert"
+                className="mt-2 flex items-start gap-2 rounded-sm border border-warning/60 bg-warning/10 px-2.5 py-1.5 text-xs text-warning"
+              >
+                <TriangleAlert className="mt-0.5 size-3.5 shrink-0" />
+                <span className="min-w-0 break-words">
+                  {statusChanged
+                    ? `This explanation was written for ${SAFETY_STATUS_LABEL[aiSafety.status]}, but the current rule-based status is ${SAFETY_STATUS_LABEL[assessment!.status]} (the data or thresholds changed). Re-run the analysis.`
+                    : `${aiSafety.reviewReason ?? "The AI wording needs review."} The rule-based status above stands.`}
+                </span>
+              </p>
+            )}
+          </>
+        )}
+      </div>
       <div className="grid gap-4 lg:grid-cols-[1.1fr_1fr]">
         <div className="rounded-md border border-primary/40 bg-surface p-5">
           <p className="font-mono text-[10px] tracking-wider text-primary">HEADLINE READ</p>
@@ -332,6 +400,9 @@ function AnalystPanel({
         </div>
         <div className="grid gap-3">
           <div className="grid gap-2">
+            <p className="font-mono text-[10px] tracking-wider text-muted-foreground">
+              STATISTICAL FINDINGS · TREND/OUTLIER SEVERITY, NOT SAFETY THRESHOLDS
+            </p>
             {insights.findings.map((f, i) => (
               <div
                 key={i}
@@ -374,7 +445,7 @@ function AnalystPanel({
       </div>
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
         <p className="min-w-0 flex-1 font-mono text-[10px] leading-relaxed text-muted-foreground">
-          MODEL: {analysis.model} ({aiClient.mode === "browser" ? "IN YOUR BROWSER" : "LOCAL"}) · {new Date(analysis.analysedAt).toLocaleString()}
+          MODEL: {analysis.model} ({analysis.provider === "webllm" ? "IN YOUR BROWSER" : "LOCAL"}) · {new Date(analysis.analysedAt).toLocaleString()}
           {analysis.durationMs ? ` · ${(analysis.durationMs / 1000).toFixed(1)} s` : ""}
           <br />
           FINDING FACTS AND SEVERITY ARE COMPUTED BY THE APP; THE MODEL WRITES THE WORDING AND EXPLANATIONS.
@@ -384,7 +455,9 @@ function AnalystPanel({
           {AI_DISCLAIMER}
         </p>
         <button
-          onClick={() => downloadText(reportFileName(dataset.name), buildMarkdownReport(dataset, analysis))}
+          onClick={() =>
+            downloadText(reportFileName(dataset.name), buildMarkdownReport(dataset, analysis, assessment ?? undefined))
+          }
           className="flex items-center gap-2 rounded-sm border border-border bg-surface px-3 py-1.5 font-mono text-[11px] tracking-wider text-foreground transition-colors hover:border-primary/60"
         >
           <Download className="size-3.5" />
@@ -510,6 +583,12 @@ function Dashboard() {
   const [selected, setSelected] = useState<string[]>([]);
   const [normalized, setNormalized] = useState(false);
   const [analysis, setAnalysis] = useState<AnalysisRecord | null>(null);
+  const activeRules = useActiveRules();
+  // Rule-based safety classification: deterministic, independent of the AI model.
+  const assessment = useMemo(
+    () => (dataset ? assessSafety(dataset, activeRules.rules, { rulesSource: activeRules.source }) : null),
+    [dataset, activeRules],
+  );
   const [savedRunId, setSavedRunId] = useState<string | null>(null);
   const [runKey, setRunKey] = useState(0);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -672,7 +751,7 @@ function Dashboard() {
             title="PARAMETER DECK"
             right={
               <span className="font-mono text-[10px] tracking-wider text-muted-foreground">
-                7-DAY MOVING AVERAGE PER PARAMETER
+                1-HOUR MOVING AVERAGE PER PARAMETER (TRAILING 60 MIN)
               </span>
             }
           />
@@ -714,7 +793,14 @@ function Dashboard() {
               </span>
             }
           />
-          <AnalystPanel dataset={dataset} analysis={analysis} runKey={runKey} onAnalysis={setAnalysis} />
+          {dataset && assessment && <SafetyPanel assessment={assessment} rules={activeRules} />}
+          <AnalystPanel
+            dataset={dataset}
+            assessment={assessment}
+            analysis={analysis}
+            runKey={runKey}
+            onAnalysis={setAnalysis}
+          />
         </section>
       </main>
 

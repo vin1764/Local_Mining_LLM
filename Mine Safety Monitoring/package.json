@@ -14,6 +14,7 @@
     "preview:pages": "vite preview --config vite.pages.config.ts --host 127.0.0.1 --port 8081",
     "preview": "vite preview",
     "start": "node scripts/start.mjs",
+    "start:with-pages": "node scripts/start.mjs --allow-origin https://vin1764.github.io",
     "doctor": "node scripts/doctor.mjs",
     "setup:model": "ollama pull qwen2.5:1.5b",
     "lint": "eslint .",

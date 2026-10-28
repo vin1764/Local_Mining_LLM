@@ -25,7 +25,9 @@ export default defineConfig({
   nitro: { preset: "node-server" },
   vite: {
     // Listen on loopback only: the app is not reachable from other machines.
-    server: { host, port, strictPort: true },
+    // cors: false — Vite's built-in CORS must not answer for the app; the
+    // local AI API applies its own strict allowlist (CORS_ALLOWED_ORIGINS).
+    server: { host, port, strictPort: true, cors: false },
     preview: { host, port, strictPort: true },
   },
 });

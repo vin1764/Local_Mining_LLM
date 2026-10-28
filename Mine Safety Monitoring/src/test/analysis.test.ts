@@ -86,7 +86,8 @@ describe("deterministic facts", () => {
     expect(sheet).toMatch(/temperature_c \(unit °C\): ROSE\. Rose 9\.6%/);
     expect(sheet).toMatch(/airflow_m3s \(unit m³\/s\): FELL\. Fell 14\.8%/);
     expect(sheet).toContain("co_ppm (unit ppm)");
-    expect(sheet).toContain("SAFETY THRESHOLDS: none provided");
+    expect(sheet).toContain("SAFETY ASSESSMENT (rule-based, final):");
+    expect(sheet).toContain("STATUS: INSUFFICIENT_DATA");
   });
 
   it("assigns severity with the documented rule", () => {

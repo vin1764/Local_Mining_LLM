@@ -14,7 +14,8 @@ export type LocalAiErrorCode =
   | "runtime_error" // the runtime reported an error
   | "invalid_input" // the request payload failed validation
   | "consent_required" // browser mode: the model must be downloaded first
-  | "unsupported"; // browser mode: no WebGPU on this device
+  | "unsupported" // browser mode: no WebGPU on this device
+  | "backend_unavailable"; // Pages edition: the local STRATA app is not reachable
 
 export class LocalAiError extends Error {
   override name = "LocalAiError";
@@ -43,6 +44,10 @@ export interface ProviderStatus {
   unsupported?: boolean;
   /** Browser mode: approximate one-time download size. */
   downloadSizeMB?: number;
+  /** Pages edition: the local STRATA app (Ollama) was not reachable. */
+  localBackendMissing?: boolean;
+  /** Pages edition: this browser can run the in-browser model instead. */
+  browserModelAvailable?: boolean;
 }
 
 /** A JSON schema object understood by the runtime's structured-output mode. */

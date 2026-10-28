@@ -13,6 +13,7 @@ import { Activity } from "lucide-react";
 
 import {
   buildChartRows,
+  chartOrderedRows,
   computeAnomalies,
   formatValue,
   prettyName,
@@ -20,6 +21,13 @@ import {
   type Anomaly,
   type Dataset,
 } from "@/lib/dataset";
+import {
+  MOVING_AVERAGE_SHORT_LABEL,
+  MOVING_AVERAGE_WINDOW_MS,
+  medianSamplingIntervalMs,
+  movingAverage,
+  parseTimestamp,
+} from "@/lib/moving-average";
 
 export function chartColor(i: number): string {
   return `var(--chart-${(i % 6) + 1})`;
@@ -187,7 +195,7 @@ export function TrendConsole({ dataset, selected, normalized, onToggle, onNormal
   );
 }
 
-/* ---------------- Deep dive: small multiples with moving average ---------------- */
+/* ---------------- Deep dive: small multiples with a 1-hour moving average ---------------- */
 
 interface MiniChartProps {
   dataset: Dataset;
@@ -205,17 +213,24 @@ export function MiniChart({ dataset, column, colorIndex }: MiniChartProps) {
   const meta = dataset.columns.find((c) => c.name === column);
   const stats = meta?.stats;
 
-  const rows = useMemo(() => {
+  const { rows, sparse } = useMemo(() => {
     const base = buildChartRows(dataset, [column]);
-    const window = 7;
-    return base.map((r, i) => {
-      const slice = base.slice(Math.max(0, i - window + 1), i + 1);
-      const vals = slice.map((s) => s[column]).filter((v): v is number => typeof v === "number");
-      const ma = vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : (r[column] as number);
+    // Trailing 1-hour window by timestamp (see lib/moving-average.ts). Missing
+    // values are excluded; without a time column there is no 1-hour window.
+    const tc = dataset.timeColumn;
+    const points = chartOrderedRows(dataset).map((r) => {
+      const v = r[column];
+      return { t: tc ? parseTimestamp(r[tc]) : null, value: typeof v === "number" ? v : null };
+    });
+    const ma = tc ? movingAverage(points) : null;
+    const interval = tc ? medianSamplingIntervalMs(points.map((p) => p.t)) : null;
+    const out = base.map((r, i) => {
+      const avg = ma?.[i]?.avg ?? null;
       const z =
         stats && stats.std > 0 ? Math.abs(((r[column] as number) - stats.mean) / stats.std) : 0;
-      return { ...r, _ma: Number(ma.toFixed(3)), _anom: z >= 3 };
+      return { ...r, _ma: avg === null ? null : Number(avg.toFixed(3)), _anom: z >= 3 };
     });
+    return { rows: out, sparse: interval !== null && interval >= MOVING_AVERAGE_WINDOW_MS };
   }, [dataset, column, stats]);
 
   return (
@@ -241,7 +256,10 @@ export function MiniChart({ dataset, column, colorIndex }: MiniChartProps) {
               fontFamily: "IBM Plex Mono",
             }}
             labelFormatter={() => ""}
-            formatter={(v: any) => [formatValue(Number(v), meta?.unit), prettyName(column)]}
+            formatter={(v: any, _name: any, item: any) => [
+              formatValue(Number(v), meta?.unit),
+              item?.dataKey === "_ma" ? MOVING_AVERAGE_SHORT_LABEL : prettyName(column),
+            ]}
             cursor={{ stroke: "var(--color-primary)", strokeOpacity: 0.4 }}
           />
           <Line
@@ -261,6 +279,7 @@ export function MiniChart({ dataset, column, colorIndex }: MiniChartProps) {
             strokeWidth={1}
             strokeDasharray="4 4"
             dot={false}
+            connectNulls={false}
             isAnimationActive={false}
           />
         </LineChart>
@@ -268,7 +287,11 @@ export function MiniChart({ dataset, column, colorIndex }: MiniChartProps) {
       <div className="mt-1 flex items-center justify-between font-mono text-[10px] text-muted-foreground">
         <span className="flex items-center gap-1">
           <span className="inline-block h-px w-4 border-t border-dashed border-foreground/50" />
-          7-DAY MA
+          {!dataset.timeColumn
+            ? `${MOVING_AVERAGE_SHORT_LABEL} N/A (NO TIME COLUMN)`
+            : sparse
+              ? `${MOVING_AVERAGE_SHORT_LABEL} · ≤1 READING/HOUR`
+              : MOVING_AVERAGE_SHORT_LABEL}
         </span>
         {stats && stats.anomalyCount > 0 ? (
           <span className="text-negative">{stats.anomalyCount} OUTLIERS</span>
