@@ -283,7 +283,7 @@ its result, latest value, 1-hour average, worst value, thresholds and source.
 
 ### Built-in rules (Coal Mines Regulations, 2017)
 
-`src/config/safety-rules.json` ships 24 rules covering all 18 sensor fields.
+`src/config/safety-rules.json` ships 23 rules covering all 18 sensor fields.
 Sources and verbatim clauses are in [docs/safety-sources.md](docs/safety-sources.md).
 
 | Checked by default | Threshold | Source |
